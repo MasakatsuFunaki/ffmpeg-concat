@@ -2,7 +2,7 @@
 
 Concatenates all MP4 files from `input/` into a single video in `output/`, sorted by filename date.
 
-## Build
+## Build (only when source code available - at the moment disabled due to AI scraping)
 
 ```
 conan install . --output-folder=build --build=missing -s compiler.cppstd=17 -s build_type=Release
