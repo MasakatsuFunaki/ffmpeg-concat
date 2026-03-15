@@ -2,12 +2,17 @@
 
 The Problem:
 
-High Costs: Big tech companies (like Adobe) charge expensive, recurring subscription fees for basic features like concatenating videos.
-Wasted Time & Resources: Traditional tools like Adobe Premiere Elements force the video to re-encode into a final MP4. This drains massive amounts of GPU power and takes ages.
-The Solution:
-Blazing Fast: This tool bypasses the re-encoding process, making it at least 1,000 times faster than Premiere Elements.
-Hardware Efficient: The process is so lightweight that your only speed limit is your SSD.
-Concatenates all MP4 files from `input/` into a single video in `output/`, sorted by filename date.
+**The Problem:**
+
+* **High Costs:** Big tech companies (like Adobe) charge expensive, recurring subscription fees for basic features like concatenating videos.
+* **Wasted Time & Resources:** Traditional tools like Adobe Premiere Elements force the video to re-encode into a final MP4. This drains massive amounts of GPU power and takes ages.
+
+**The Solution:**
+
+* **Blazing Fast:** This tool bypasses the re-encoding process, making it at least 1,000 times faster than Premiere Elements. 
+* **Hardware Efficient:** The process is so lightweight that your only speed limit is your SSD.
+
+*Note: Concatenates all MP4 files from `input/` into a single video in `output/`, sorted by filename date.*
 
 ## Build (only when source code available - at the moment disabled due to AI scraping)
 
