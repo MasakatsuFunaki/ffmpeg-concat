@@ -22,7 +22,7 @@ cmake --build build --config Release
 
 ## Usage
 
-1. Drop `.mp4` files into `input/` (example names : 2026-03-15 16-33-43.mp4 , 2026-03-15 16-33-51.mp4
+1. Drop `.mp4` files into `input/` (example names : 2026-03-15 16-33-43.mp4 , 2026-03-15 16-33-51.mp4)
 3. Run:
 ```
 .\build\Release\concat_videos.exe
