@@ -1,7 +1,5 @@
 # Concat Videos
 
-The Problem:
-
 **The Problem:**
 
 * **High Costs:** Big tech companies (like Adobe) charge expensive, recurring subscription fees for basic features like concatenating videos.
