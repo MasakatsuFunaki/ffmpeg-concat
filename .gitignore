@@ -1,0 +1,29 @@
+# Ignore everything
+*
+
+# Allow README
+!README.md
+
+# Allow the release exe
+!build/
+build/*
+!build/Release/
+build/Release/*
+!build/Release/concat_videos.exe
+
+# Allow ffmpeg binary parts (split for GitHub <100MB limit)
+!bin/
+bin/*
+!bin/ffmpeg.part*
+
+# Allow input/output folders (keep them as empty dirs via .gitkeep)
+!input/
+input/*
+!input/.gitkeep
+!output/
+output/*
+!output/.gitkeep
+
+# Keep .gitignore itself
+!.gitignore
+!.gitattributes
