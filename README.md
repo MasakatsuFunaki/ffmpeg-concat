@@ -1,4 +1,4 @@
-# Concat Videos
+# Concat Videos (Windows platforms only)
 
 **The Problem:**
 
