@@ -38,3 +38,5 @@ cmake --build build --config Release
 -f <path>   FFmpeg path      (default: bin/ffmpeg.exe)
 -h          Show help
 ```
+### Benchmark
+30 GB of multiple videos has been concatenated into a final file in  aprox 5 minutes on a laptop CPU:	13th Gen Intel(R) Core(TM) i7-13650HX, 2600 Mhz, 14 Core(s), 20 Logical Processor(s)
