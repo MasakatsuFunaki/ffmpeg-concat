@@ -1,15 +1,20 @@
 # Ignore everything
 *
 
-# Allow README
+# Allow top-level files
 !README.md
+!LICENSE
+!CMakeLists.txt
+!CMakeUserPresets.json
+!release.py
 
-# Allow the release exe
+
+
+# Allow build/Release/ only
 !build/
 build/*
 !build/Release/
-build/Release/*
-!build/Release/concat_videos.exe
+build/Release/**
 
 # Allow ffmpeg binary parts (split for GitHub <100MB limit)
 !bin/
@@ -27,3 +32,4 @@ output/*
 # Keep .gitignore itself
 !.gitignore
 !.gitattributes
+CMakeUserPresets.json
