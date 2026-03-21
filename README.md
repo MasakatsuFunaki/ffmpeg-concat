@@ -87,6 +87,44 @@ Concatenates (if multiple files) and re-encodes MP4 files to **AV1** format. Aut
 
 ---
 
+### cut.exe
+
+Cuts out an interval from a video **without re-encoding** (stream copy) and reassembles the remaining parts. Alternatively, applies a blur filter to the interval instead of removing it.
+
+**Parameters:**
+
+| Flag | Description | Default |
+|---|---|---|
+| `-i <file>` | Input video file (required) | |
+| `-s <sec>` | Start of interval in seconds (required) | |
+| `-e <sec>` | End of interval in seconds (required) | |
+| `-o <file>` | Output file path | auto-generated in input directory |
+| `-f <path>` | FFmpeg path | `bin/ffmpeg.exe` |
+| `--blur, -b` | Apply pixelized blur instead of cutting | off |
+| `--blur-strength` | Pixelization block size (higher = more pixelated) | `30` |
+| `-h` | Show help | |
+
+**Modes:**
+* **Cut (default):** Removes the `[start, end]` interval and concatenates the remaining parts using stream copy (no re-encoding).
+* **Blur (`--blur`):** Keeps the full video but pixelizes `[start, end]`. Requires re-encoding.
+
+**Examples:**
+```
+# Cut out seconds 4–10 from a video
+.\build\Release\cut.exe -i "input\my_video.mp4" -s 4 -e 10
+
+# Pixelize seconds 4–10 instead of removing them
+.\build\Release\cut.exe -i "input\my_video.mp4" -s 4 -e 10 --blur
+
+# Pixelize with stronger effect (larger blocks)
+.\build\Release\cut.exe -i "input\my_video.mp4" -s 4 -e 10 --blur --blur-strength 50
+
+# Pixelize and save to specific path
+.\build\Release\cut.exe -i "input\my_video.mp4" -s 4 -e 10 --blur -o "output\censored.mp4"
+```
+
+---
+
 ## Releasing
 
 After developing on `dev` branch, run:
