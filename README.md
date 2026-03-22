@@ -102,6 +102,7 @@ Cuts out one or more intervals from a video **without re-encoding** (stream copy
 | `-f <path>` | FFmpeg path | `bin/ffmpeg.exe` |
 | `--blur, -b` | Apply pixelized blur instead of cutting | off |
 | `--blur-strength` | Pixelization block size (higher = more pixelated) | `30` |
+| `--sound-off` | Mute audio during blurred intervals (only with `--blur`) | off |
 | `-h` | Show help | |
 
 **Modes:**
@@ -127,6 +128,9 @@ Cuts out one or more intervals from a video **without re-encoding** (stream copy
 
 # Pixelize and save to specific path
 .\build\Release\cut.exe -i "input\my_video.mp4" -s 4 -e 10 --blur -o "output\censored.mp4"
+
+# Pixelize multiple intervals and mute audio during those parts
+.\build\Release\cut.exe -i "input\my_video.mp4" -s 3 9 -e 5 11 --blur --sound-off
 ```
 
 ---
