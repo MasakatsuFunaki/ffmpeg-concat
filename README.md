@@ -135,6 +135,72 @@ Cuts out one or more intervals from a video **without re-encoding** (stream copy
 
 ---
 
+### split.exe
+
+Splits a video into multiple parts at given time points **without re-encoding** (stream copy). Supports both absolute and relative split points.
+
+**Parameters:**
+
+| Flag | Description | Default |
+|---|---|---|
+| `-i <file>` | Input video file (required) | |
+| `-p <sec...>` | Split points in seconds, space-separated (required) | |
+| `-r` | Treat split points as relative to the previous split | absolute |
+| `-o <dir>` | Output directory | same as input file |
+| `-f <path>` | FFmpeg path | `bin/ffmpeg.exe` |
+| `-h` | Show help | |
+
+**Modes:**
+* **Absolute (default):** Split points are offsets from the start of the video.
+* **Relative (`-r`):** Each split point is relative to the previous one (e.g., `-p 10 20 30` → splits at 10s, 30s, 60s).
+
+**Examples:**
+```
+# Split at 10s and 30s → 3 parts: [0,10], [10,30], [30,end]
+.\build\Release\split.exe -i "input\my_video.mp4" -p 10 30
+
+# Split into 4 equal-ish parts using relative durations of 15s each
+.\build\Release\split.exe -i "input\my_video.mp4" -p 15 15 15 -r
+
+# Split and save parts to output directory
+.\build\Release\split.exe -i "input\my_video.mp4" -p 10 30 60 -o output
+```
+
+---
+
+## Testing
+
+The project includes Google Test suites for each tool. Test data (a short MP4 video) lives in `tests/input/` and is automatically copied into the build directory at configure time. All test outputs go to `build/tests/output/`.
+
+**Run all tests (from project root):**
+```
+ctest --test-dir build --build-config Release --output-on-failure
+```
+
+**Run a single test suite:**
+```
+ctest --test-dir build --build-config Release -R test_cut --output-on-failure
+```
+
+**Or run a test executable directly (with verbose GTest output):**
+```
+.\build\Release\test_common.exe
+.\build\Release\test_concat.exe
+.\build\Release\test_transcode.exe
+.\build\Release\test_cut.exe
+.\build\Release\test_split.exe
+```
+
+| Suite | Tests | What it covers |
+|---|---|---|
+| `test_common` | 11 | `current_timestamp`, `get_file_date`, `ensure_ffmpeg`, `collect_mp4_files`, `get_video_duration`, `run_ffmpeg_segment` |
+| `test_concat` | 4 | Help flag, missing/invalid input, actual 2-file concat |
+| `test_transcode` | 3 | Help flag, missing/invalid input |
+| `test_cut` | 7 | Help flag, missing input, basic cut, blur, multi-interval, blur + sound-off |
+| `test_split` | 6 | Help flag, missing input, single/multi split (absolute), relative mode |
+
+---
+
 ## Releasing
 
 After developing on `dev` branch, run:
