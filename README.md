@@ -2,14 +2,35 @@
 
 A collection of fast, lightweight command-line video tools powered by FFmpeg. No subscriptions, no bloat — just drop your files and run. Supports **Windows** and **Linux**.
 
+**How does this compare to existing tools?**
+
+| | **FFmpeg Codec Tools** | **Adobe Premiere Pro** | **DaVinci Resolve** | **HandBrake** | **LosslessCut** | **Raw FFmpeg CLI** |
+|---|---|---|---|---|---|---|
+| **Price** | Free | ~$23/mo | Free / $295 | Free | Free | Free |
+| **Lossless concat** | Yes (stream copy) | No (re-encodes) | No (re-encodes) | No | No | Yes (manual) |
+| **Lossless cut/split** | Yes (stream copy) | No (re-encodes) | No (re-encodes) | No | Yes | Yes (manual) |
+| **HW-accel transcode** | Yes (NVENC AV1) | Yes | Yes | Limited | No | Yes (manual) |
+| **Batch-friendly** | Yes (drop files & run) | Manual import | Manual import | Yes | No | Yes (scripting) |
+| **Learning curve** | Minimal | High | High | Low | Low | Very high |
+| **Pixelized blur** | Yes | Yes | Yes | No | No | Yes (manual) |
+
 **Why not use Adobe Premiere / other editors?**
-* Big tech charges expensive recurring fees for basic video operations.
-* Editors like Premiere Elements re-encode everything by default, wasting GPU power and time even when no edits are made.
+* **Premiere Pro** costs ~$23/month — that's ~$276/year for operations that should be free.
+* **Premiere Elements** (~$100 one-time) and **DaVinci Resolve** re-encode everything on export, even when no edits are made. A simple concat that should take seconds takes minutes and degrades quality.
+* Full editors are overkill when all you need is "join these clips" or "cut out this section."
+
+**Why not just use FFmpeg directly?**
+* Raw FFmpeg commands for concat, cut, split, and AV1 transcoding are verbose and error-prone. A simple concat requires creating a text manifest, escaping paths, and remembering the right flags. This project wraps all of that into single commands with sane defaults.
+
+**Why not LosslessCut?**
+* LosslessCut is great for interactive single-file trimming, but it has no batch concat, no AV1 hardware transcoding, no CLI automation, and no pixelized blur mode.
 
 **Why these tools?**
-* **Blazing fast** — concat uses stream copy (no re-encoding), transcode uses NVIDIA hardware acceleration when available.
+* **Blazing fast** — concat/cut/split use stream copy (no re-encoding); transcode uses NVIDIA NVENC when available.
 * **Hardware efficient** — concat is limited only by your SSD speed; transcode offloads to your GPU.
-* **Simple** — drop MP4 files into `input/`, run the exe, get your output.
+* **Simple** — drop MP4 files into `input/`, run the exe, get your output. No timeline, no project files, no UI.
+* **Scriptable** — CLI-first design means you can integrate into pipelines, cron jobs, or batch scripts.
+* **Free & open source** — no subscriptions, no telemetry, no accounts.
 
 ## Tools
 
