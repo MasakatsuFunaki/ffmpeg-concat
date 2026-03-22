@@ -210,5 +210,3 @@ cmake --preset conan-release -DBUILD_TESTING=ON
 cmake --build --preset conan-release
 ctest --preset conan-release --output-on-failure
 ```
-
-**Note:** The ffmpeg binary is not included in the source repo. Run `bash scripts/prepare_ffmpeg_linux.sh` to download and split it into `bin/ffmpeg_linux.part*` — the tools auto-assemble it on first run.
