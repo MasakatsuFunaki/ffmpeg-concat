@@ -16,6 +16,9 @@ build/*
 !build/Release/
 build/Release/**
 
+# Exclude test executables from Release
+build/Release/test*.exe
+
 # Allow ffmpeg binary parts (split for GitHub <100MB limit)
 !bin/
 bin/*
