@@ -184,11 +184,11 @@ ctest --test-dir build --build-config Release -R test_cut --output-on-failure
 
 **Or run a test executable directly (with verbose GTest output):**
 ```
-.\build\Release\test_common.exe
-.\build\Release\test_concat.exe
-.\build\Release\test_transcode.exe
-.\build\Release\test_cut.exe
-.\build\Release\test_split.exe
+.\build\tests\bin\Release\test_common.exe
+.\build\tests\bin\Release\test_concat.exe
+.\build\tests\bin\Release\test_transcode.exe
+.\build\tests\bin\Release\test_cut.exe
+.\build\tests\bin\Release\test_split.exe
 ```
 
 | Suite | Tests | What it covers |
