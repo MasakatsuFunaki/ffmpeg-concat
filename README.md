@@ -16,7 +16,32 @@ A collection of fast, lightweight command-line video tools powered by FFmpeg. No
 ```
 conan install . --output-folder=build --build=missing -s compiler.cppstd=17 -s build_type=Release
 cmake --preset conan-default
+```
+
+**Release build:**
+```
 cmake --build build --config Release
+```
+
+**Debug build:**
+```
+cmake --build build --config Debug
+```
+
+**Build with tests:**
+```
+cmake --preset conan-default -DBUILD_TESTING=ON
+cmake --build build --config Release
+```
+
+**Run all tests:**
+```
+ctest --test-dir build --build-config Release --output-on-failure
+```
+
+**Run a single test suite:**
+```
+ctest --test-dir build --build-config Release -R test_cut --output-on-failure
 ```
 
 ---
@@ -165,39 +190,6 @@ Splits a video into multiple parts at given time points **without re-encoding** 
 # Split and save parts to output directory
 .\build\Release\split.exe -i "input\my_video.mp4" -p 10 30 60 -o output
 ```
-
----
-
-## Testing
-
-The project includes Google Test suites for each tool. Test data (a short MP4 video) lives in `tests/input/` and is automatically copied into the build directory at configure time. All test outputs go to `build/tests/output/`.
-
-**Run all tests (from project root):**
-```
-ctest --test-dir build --build-config Release --output-on-failure
-```
-
-**Run a single test suite:**
-```
-ctest --test-dir build --build-config Release -R test_cut --output-on-failure
-```
-
-**Or run a test executable directly (with verbose GTest output):**
-```
-.\build\tests\bin\Release\test_common.exe
-.\build\tests\bin\Release\test_concat.exe
-.\build\tests\bin\Release\test_transcode.exe
-.\build\tests\bin\Release\test_cut.exe
-.\build\tests\bin\Release\test_split.exe
-```
-
-| Suite | Tests | What it covers |
-|---|---|---|
-| `test_common` | 11 | `current_timestamp`, `get_file_date`, `ensure_ffmpeg`, `collect_mp4_files`, `get_video_duration`, `run_ffmpeg_segment` |
-| `test_concat` | 4 | Help flag, missing/invalid input, actual 2-file concat |
-| `test_transcode` | 3 | Help flag, missing/invalid input |
-| `test_cut` | 7 | Help flag, missing input, basic cut, blur, multi-interval, blur + sound-off |
-| `test_split` | 6 | Help flag, missing input, single/multi split (absolute), relative mode |
 
 ---
 
