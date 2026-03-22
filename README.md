@@ -1,6 +1,6 @@
-# FFmpeg Codec Tools (Windows)
+# FFmpeg Codec Tools
 
-A collection of fast, lightweight command-line video tools powered by FFmpeg. No subscriptions, no bloat — just drop your files and run.
+A collection of fast, lightweight command-line video tools powered by FFmpeg. No subscriptions, no bloat — just drop your files and run. Supports **Windows** and **Linux**.
 
 **Why not use Adobe Premiere / other editors?**
 * Big tech charges expensive recurring fees for basic video operations.
@@ -12,6 +12,8 @@ A collection of fast, lightweight command-line video tools powered by FFmpeg. No
 * **Simple** — drop MP4 files into `input/`, run the exe, get your output.
 
 ## Build (only when source code available - at the moment disabled due to AI scraping)
+
+### Windows
 
 ```
 conan install . --output-folder=build --build=missing -s compiler.cppstd=17 -s build_type=Release
@@ -44,11 +46,35 @@ ctest --test-dir build --build-config Release --output-on-failure
 ctest --test-dir build --build-config Release -R test_cut --output-on-failure
 ```
 
+### Linux
+
+**Prerequisites:** GCC 9+ (or Clang 10+), CMake 3.15+, Conan 2.x, `curl`, `tar`
+
+**Prepare FFmpeg binary:**
+```bash
+bash scripts/prepare_ffmpeg_linux.sh
+```
+This downloads a static ffmpeg build from [BtbN/FFmpeg-Builds](https://github.com/BtbN/FFmpeg-Builds/releases) and splits it into `bin/ffmpeg_linux.part*` files — the app auto-assembles them on first run (same approach as Windows).
+
+**Build:**
+```bash
+conan install . --output-folder=build --build=missing -s compiler.cppstd=17 -s build_type=Release
+cmake --preset conan-default
+cmake --build build --config Release
+```
+
+**Build with tests:**
+```bash
+cmake --preset conan-default -DBUILD_TESTING=ON
+cmake --build build --config Release
+ctest --test-dir build --build-config Release --output-on-failure
+```
+
 ---
 
 ## Tools
 
-### concat_videos.exe
+### concat_videos
 
 Concatenates multiple MP4 files into a single video **without re-encoding** (stream copy). Files are sorted by the date in their filename.
 
@@ -58,7 +84,7 @@ Concatenates multiple MP4 files into a single video **without re-encoding** (str
 |---|---|---|
 | `-i <dir>` | Input directory | `input` |
 | `-o <dir>` | Output directory | `output` |
-| `-f <path>` | FFmpeg path | `bin/ffmpeg.exe` |
+| `-f <path>` | FFmpeg path | `bin/ffmpeg.exe` (Win) / `bin/ffmpeg` (Linux) |
 | `-h` | Show help | |
 
 **Example:**
@@ -72,7 +98,7 @@ Concatenates multiple MP4 files into a single video **without re-encoding** (str
 
 ---
 
-### transcode.exe
+### transcode
 
 Concatenates (if multiple files) and re-encodes MP4 files to **AV1** format. Automatically detects the best available encoder: NVIDIA NVENC GPU → SVT-AV1 CPU → libaom CPU.
 
@@ -82,7 +108,7 @@ Concatenates (if multiple files) and re-encodes MP4 files to **AV1** format. Aut
 |---|---|---|
 | `-i <dir>` | Input directory | `input` |
 | `-o <dir>` | Output directory | `output` |
-| `-f <path>` | FFmpeg path | `bin/ffmpeg.exe` |
+| `-f <path>` | FFmpeg path | `bin/ffmpeg.exe` (Win) / `bin/ffmpeg` (Linux) |
 | `-q <0-51>` | Quality / CRF (lower = better) | `30` |
 | `-p <preset>` | Encoder preset | auto |
 | `-e <encoder>` | Force encoder (`av1_nvenc`, `libsvtav1`, `libaom-av1`) | auto-detect |
@@ -112,7 +138,7 @@ Concatenates (if multiple files) and re-encodes MP4 files to **AV1** format. Aut
 
 ---
 
-### cut.exe
+### cut
 
 Cuts out one or more intervals from a video **without re-encoding** (stream copy) and reassembles the remaining parts. Alternatively, pixelizes the intervals instead of removing them.
 
@@ -124,7 +150,7 @@ Cuts out one or more intervals from a video **without re-encoding** (stream copy
 | `-s <sec...>` | Start(s) of interval(s) in seconds, space-separated (required) | |
 | `-e <sec...>` | End(s) of interval(s) in seconds, space-separated (required) | |
 | `-o <file>` | Output file path | auto-generated in input directory |
-| `-f <path>` | FFmpeg path | `bin/ffmpeg.exe` |
+| `-f <path>` | FFmpeg path | `bin/ffmpeg.exe` (Win) / `bin/ffmpeg` (Linux) |
 | `--blur, -b` | Apply pixelized blur instead of cutting | off |
 | `--blur-strength` | Pixelization block size (higher = more pixelated) | `30` |
 | `--sound-off` | Mute audio during blurred intervals (only with `--blur`) | off |
@@ -160,7 +186,7 @@ Cuts out one or more intervals from a video **without re-encoding** (stream copy
 
 ---
 
-### split.exe
+### split
 
 Splits a video into multiple parts at given time points **without re-encoding** (stream copy). Supports both absolute and relative split points.
 
@@ -172,7 +198,7 @@ Splits a video into multiple parts at given time points **without re-encoding** 
 | `-p <sec...>` | Split points in seconds, space-separated (required) | |
 | `-r` | Treat split points as relative to the previous split | absolute |
 | `-o <dir>` | Output directory | same as input file |
-| `-f <path>` | FFmpeg path | `bin/ffmpeg.exe` |
+| `-f <path>` | FFmpeg path | `bin/ffmpeg.exe` (Win) / `bin/ffmpeg` (Linux) |
 | `-h` | Show help | |
 
 **Modes:**
