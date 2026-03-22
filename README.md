@@ -11,67 +11,6 @@ A collection of fast, lightweight command-line video tools powered by FFmpeg. No
 * **Hardware efficient** — concat is limited only by your SSD speed; transcode offloads to your GPU.
 * **Simple** — drop MP4 files into `input/`, run the exe, get your output.
 
-## Build (only when source code available - at the moment disabled due to AI scraping)
-
-### Windows
-
-```
-conan install . --output-folder=build --build=missing -s compiler.cppstd=17 -s build_type=Release
-cmake --preset conan-default
-```
-
-**Release build:**
-```
-cmake --build build --config Release
-```
-
-**Debug build:**
-```
-cmake --build build --config Debug
-```
-
-**Build with tests:**
-```
-cmake --preset conan-default -DBUILD_TESTING=ON
-cmake --build build --config Release
-```
-
-**Run all tests:**
-```
-ctest --test-dir build --build-config Release --output-on-failure
-```
-
-**Run a single test suite:**
-```
-ctest --test-dir build --build-config Release -R test_cut --output-on-failure
-```
-
-### Linux
-
-**Prerequisites:** GCC 9+ (or Clang 10+), CMake 3.15+, Conan 2.x, `curl`, `tar`
-
-**Prepare FFmpeg binary:**
-```bash
-bash scripts/prepare_ffmpeg_linux.sh
-```
-This downloads a static ffmpeg build from [BtbN/FFmpeg-Builds](https://github.com/BtbN/FFmpeg-Builds/releases) and splits it into `bin/ffmpeg_linux.part*` files — the app auto-assembles them on first run (same approach as Windows).
-
-**Build:**
-```bash
-conan install . --output-folder=build --build=missing -s compiler.cppstd=17 -s build_type=Release
-cmake --preset conan-default
-cmake --build build --config Release
-```
-
-**Build with tests:**
-```bash
-cmake --preset conan-default -DBUILD_TESTING=ON
-cmake --build build --config Release
-ctest --test-dir build --build-config Release --output-on-failure
-```
-
----
-
 ## Tools
 
 ### concat_videos
@@ -222,7 +161,54 @@ Splits a video into multiple parts at given time points **without re-encoding** 
 ## Releasing
 
 After developing on `dev` branch, run:
+```bash
+python3 release.py
 ```
-python release.py
+This will build, copy artifacts to `build/release/<os>/`, switch to `master`, push to GitHub, and switch back to `dev`.
+
+---
+
+## Building from Source
+
+### Windows
+
+**Prerequisites:** Visual Studio 2022, CMake 3.15+, Conan 2.x
+
+```bat
+python switch_build.py
+conan install . --output-folder=build --build=missing
+cmake --preset conan-default
+cmake --build build --config Release
 ```
-This will build the exe, switch to `master`, update the binary, push to GitHub, and switch back to `dev`.
+
+**Debug build:**
+```bat
+cmake --build build --config Debug
+```
+
+**Run tests:**
+```bat
+cmake --preset conan-default -DBUILD_TESTING=ON
+cmake --build build --config Release
+ctest --test-dir build --build-config Release --output-on-failure
+```
+
+### Linux
+
+**Prerequisites:** GCC 9+, CMake 3.15+, Conan 2.x (`pip install conan`), `curl`, `tar`
+
+```bash
+python3 switch_build.py
+conan install . --output-folder=build_linux --build=missing
+cmake --preset conan-release
+cmake --build --preset conan-release
+```
+
+**Run tests:**
+```bash
+cmake --preset conan-release -DBUILD_TESTING=ON
+cmake --build --preset conan-release
+ctest --preset conan-release --output-on-failure
+```
+
+**Note:** The ffmpeg binary is not included in the source repo. Run `bash scripts/prepare_ffmpeg_linux.sh` to download and split it into `bin/ffmpeg_linux.part*` — the tools auto-assemble it on first run.
