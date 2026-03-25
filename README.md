@@ -179,6 +179,59 @@ Splits a video into multiple parts at given time points **without re-encoding** 
 
 ---
 
+### extract
+
+Extracts image frames from all videos in a directory. Three modes: equally-spaced sampling, AI-powered auto-detection of visually striking frames using OpenCV (scored by sharpness, color saturation, contrast, and edge density), and text extraction that detects and crops unique text regions (Latin/Western) from frames.
+
+**Parameters:**
+
+| Flag | Description | Default |
+|---|---|---|
+| `-i <dir>` | Input directory containing video files (required) | `input` |
+| `-o <dir>` | Output directory for extracted frames | `output` |
+| `-f <path>` | FFmpeg path | `bin/ffmpeg.exe` (Win) / `bin/ffmpeg` (Linux) |
+| `--image <N>` | Extract N equally-spaced frames per video | |
+| `--image-detect` | Auto-detect visually striking frames (max 100 per video) | |
+| `--extract-text` | Extract unique text crops from frames (Latin/Western text) | |
+| `-h` | Show help | |
+
+**Modes:**
+* **`--image N`:** Extracts exactly N frames spaced equally across the video duration. Fast — just FFmpeg seeks.
+* **`--image-detect`:** Samples up to 500 candidate frames, then scores each one with OpenCV on 4 metrics (sharpness, color saturation, contrast, edge density). Keeps the top 100 most visually striking frames.
+* **`--extract-text`:** Samples frames across the video, detects text regions using MSER (Maximally Stable Extremal Regions), groups nearby characters into text blocks, and crops only the text rectangles. Deduplicates crops so each saved image contains unique text not seen in previous frames. Ideal for extracting subtitles, dialogue boxes, book pages, UI text, etc.
+* All modes can be used **simultaneously**. Output goes into separate subdirectories.
+
+**Supported video formats:** mp4, avi, mkv, mov, wmv, flv, webm, ts, m4v
+
+**Output structure:**
+```
+output/
+  <video_stem>/
+    image/           ← equally-spaced frames (frame_0001.jpg, ...)
+    detect/          ← striking frames (striking_0001.jpg, ...)
+    text/            ← unique text crops (text_0001.jpg, ...)
+```
+
+**Examples:**
+```
+# Extract 10 equally-spaced frames from all videos in input/
+.\build\Release\extract.exe --image 10
+
+# Auto-detect striking frames from all videos in input/
+.\build\Release\extract.exe --image-detect
+
+# Extract unique text crops from all videos in input/
+.\build\Release\extract.exe --extract-text
+
+# All three modes at once, custom input/output directories
+.\build\Release\extract.exe --image 5 --image-detect --extract-text -i my_videos -o my_frames
+
+# Specific input folder and ffmpeg path
+.\build\Release\extract.exe --image 20 -i recordings -o thumbnails -f bin\ffmpeg.exe
+```
+
+---
+
 ## Releasing
 
 After developing on `dev` branch, run:
