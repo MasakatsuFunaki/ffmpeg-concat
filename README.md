@@ -1,21 +1,13 @@
 # FFmpeg Codec Tools
 
-A collection of fast, lightweight command-line video tools powered by FFmpeg. No subscriptions, no bloat — just drop your files and run. Supports **Windows** and **Linux**.
+Fast, lightweight CLI video tools powered by FFmpeg. No subscriptions, no re-encoding overhead — just drop files and run. Supports **Windows** and **Linux**.
 
-**Why not use Adobe Premiere / other editors?**
-* **Premiere Pro** costs ~$23/month — that's ~$276/year for operations that should be free.
-* **Premiere Elements** (~$100 one-time) and **DaVinci Resolve** re-encode everything on export, even when no edits are made. A simple concat that should take seconds takes minutes and degrades quality.
-* Full editors are overkill when all you need is "join these clips" or "cut out this section."
+Full editors like Premiere Pro (~$276/year) or DaVinci Resolve re-encode everything on export, even for a simple concat. Raw FFmpeg commands are verbose and error-prone. These tools wrap the common operations into single commands with sane defaults.
 
-**Why not just use FFmpeg directly?**
-* Raw FFmpeg commands for concat, cut, split, and AV1 transcoding are verbose and error-prone. A simple concat requires creating a text manifest, escaping paths, and remembering the right flags. This project wraps all of that into single commands with sane defaults.
+* **Fast** — concat/cut/split use stream copy; transcode uses NVIDIA NVENC when available
+* **Simple** — drop MP4s into `input/`, run the tool, get output
+* **Free & open source** — no accounts, no telemetry
 
-**Why these tools?**
-* **Blazing fast** — concat/cut/split use stream copy (no re-encoding); transcode uses NVIDIA NVENC when available.
-* **Hardware efficient** — concat is limited only by your SSD speed; transcode offloads to your GPU.
-* **Simple** — drop MP4 files into `input/`, run the exe, get your output. No timeline, no project files, no UI.
-* **Scriptable** — CLI-first design means you can integrate into pipelines, cron jobs, or batch scripts.
-* **Free & open source** — no subscriptions, no telemetry, no accounts.
 
 ## Tools
 
@@ -33,10 +25,15 @@ Concatenates multiple MP4 files into a single video **without re-encoding** (str
 | `-h` | Show help | |
 
 **Example:**
+```bat
+# Windows — drop files into input/: "2026-03-15 16-33-43.mp4", "2026-03-15 16-33-51.mp4"
+concat_videos.exe
+concat_videos.exe -i my_clips -o merged
 ```
-# Drop files into input/: "2026-03-15 16-33-43.mp4", "2026-03-15 16-33-51.mp4"
-.\build\Release\concat_videos.exe
-.\build\Release\concat_videos.exe -i my_clips -o merged
+```bash
+# Linux
+./concat_videos
+./concat_videos -i my_clips -o merged
 ```
 
 **Benchmark:** 30 GB of videos concatenated in ~5 minutes on a laptop (13th Gen i7-13650HX). The bottleneck is SSD speed, not CPU.
@@ -65,18 +62,19 @@ Concatenates (if multiple files) and re-encodes MP4 files to **AV1** format. Aut
 * `libaom-av1` — `0` (slowest) to `8` (fastest), default: `4`
 
 **Examples:**
+```bat
+# Windows
+transcode.exe
+transcode.exe -q 25
+transcode.exe -e av1_nvenc -p p7 -q 25
+transcode.exe -i raw_clips -o encoded
 ```
-# Basic: concat + encode to AV1 with defaults
-.\build\Release\transcode.exe
-
-# Higher quality
-.\build\Release\transcode.exe -q 25
-
-# Force NVIDIA GPU encoding with best quality preset
-.\build\Release\transcode.exe -e av1_nvenc -p p7 -q 25
-
-# Custom folders
-.\build\Release\transcode.exe -i raw_clips -o encoded
+```bash
+# Linux
+./transcode
+./transcode -q 25
+./transcode -e av1_nvenc -p p7 -q 25
+./transcode -i raw_clips -o encoded
 ```
 
 **Note:** `av1_nvenc` requires an NVIDIA RTX 4000 series (Ada Lovelace) or newer GPU.
@@ -106,27 +104,22 @@ Cuts out one or more intervals from a video **without re-encoding** (stream copy
 * **Blur (`--blur`):** Keeps the full video but pixelizes the intervals. Requires re-encoding.
 
 **Examples:**
+```bat
+# Windows
+cut.exe -i "input\my_video.mp4" -s 4 -e 10
+cut.exe -i "input\my_video.mp4" -s 4 15 -e 8 20
+cut.exe -i "input\my_video.mp4" -s 4 -e 10 --blur
+cut.exe -i "input\my_video.mp4" -s 4 15 30 -e 8 20 35 --blur
+cut.exe -i "input\my_video.mp4" -s 4 -e 10 --blur --blur-strength 50
+cut.exe -i "input\my_video.mp4" -s 4 -e 10 --blur -o "output\censored.mp4"
+cut.exe -i "input\my_video.mp4" -s 3 9 -e 5 11 --blur --sound-off
 ```
-# Cut out seconds 4–10 from a video
-.\build\Release\cut.exe -i "input\my_video.mp4" -s 4 -e 10
-
-# Cut out multiple intervals: [4,8] and [15,20]
-.\build\Release\cut.exe -i "input\my_video.mp4" -s 4 15 -e 8 20
-
-# Pixelize seconds 4–10 instead of removing them
-.\build\Release\cut.exe -i "input\my_video.mp4" -s 4 -e 10 --blur
-
-# Pixelize multiple intervals
-.\build\Release\cut.exe -i "input\my_video.mp4" -s 4 15 30 -e 8 20 35 --blur
-
-# Pixelize with stronger effect (larger blocks)
-.\build\Release\cut.exe -i "input\my_video.mp4" -s 4 -e 10 --blur --blur-strength 50
-
-# Pixelize and save to specific path
-.\build\Release\cut.exe -i "input\my_video.mp4" -s 4 -e 10 --blur -o "output\censored.mp4"
-
-# Pixelize multiple intervals and mute audio during those parts
-.\build\Release\cut.exe -i "input\my_video.mp4" -s 3 9 -e 5 11 --blur --sound-off
+```bash
+# Linux
+./cut -i "input/my_video.mp4" -s 4 -e 10
+./cut -i "input/my_video.mp4" -s 4 15 -e 8 20
+./cut -i "input/my_video.mp4" -s 4 -e 10 --blur
+./cut -i "input/my_video.mp4" -s 3 9 -e 5 11 --blur --sound-off
 ```
 
 ---
@@ -151,15 +144,17 @@ Splits a video into multiple parts at given time points **without re-encoding** 
 * **Relative (`-r`):** Each split point is relative to the previous one (e.g., `-p 10 20 30` → splits at 10s, 30s, 60s).
 
 **Examples:**
+```bat
+# Windows
+split.exe -i "input\my_video.mp4" -p 10 30
+split.exe -i "input\my_video.mp4" -p 15 15 15 -r
+split.exe -i "input\my_video.mp4" -p 10 30 60 -o output
 ```
-# Split at 10s and 30s → 3 parts: [0,10], [10,30], [30,end]
-.\build\Release\split.exe -i "input\my_video.mp4" -p 10 30
-
-# Split into 4 equal-ish parts using relative durations of 15s each
-.\build\Release\split.exe -i "input\my_video.mp4" -p 15 15 15 -r
-
-# Split and save parts to output directory
-.\build\Release\split.exe -i "input\my_video.mp4" -p 10 30 60 -o output
+```bash
+# Linux
+./split -i "input/my_video.mp4" -p 10 30
+./split -i "input/my_video.mp4" -p 15 15 15 -r
+./split -i "input/my_video.mp4" -p 10 30 60 -o output
 ```
 
 ---
@@ -198,21 +193,20 @@ output/
 ```
 
 **Examples:**
+```bat
+# Windows
+extract.exe --image 10
+extract.exe --image-detect
+extract.exe --extract-text
+extract.exe --image 5 --image-detect --extract-text -i my_videos -o my_frames
+extract.exe --image 20 -i recordings -o thumbnails -f bin\ffmpeg.exe
 ```
-# Extract 10 equally-spaced frames from all videos in input/
-.\build\Release\extract.exe --image 10
-
-# Auto-detect striking frames from all videos in input/
-.\build\Release\extract.exe --image-detect
-
-# Extract unique text crops from all videos in input/
-.\build\Release\extract.exe --extract-text
-
-# All three modes at once, custom input/output directories
-.\build\Release\extract.exe --image 5 --image-detect --extract-text -i my_videos -o my_frames
-
-# Specific input folder and ffmpeg path
-.\build\Release\extract.exe --image 20 -i recordings -o thumbnails -f bin\ffmpeg.exe
+```bash
+# Linux
+./extract --image 10
+./extract --image-detect
+./extract --extract-text
+./extract --image 5 --image-detect --extract-text -i my_videos -o my_frames
 ```
 
 ---
