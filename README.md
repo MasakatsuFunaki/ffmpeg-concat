@@ -161,25 +161,25 @@ split.exe -i "input\my_video.mp4" -p 10 30 60 -o output
 
 ### extract
 
-Extracts image frames from all videos in a directory. Three modes: equally-spaced sampling, AI-powered auto-detection of visually striking frames using OpenCV (scored by sharpness, color saturation, contrast, and edge density), and text extraction that detects and crops unique text regions (Latin/Western) from frames.
+Extracts image frames from either all videos in a directory or a single video file. Three modes: equally-spaced sampling, AI-powered auto-detection of visually striking frames using OpenCV (scored by sharpness, color saturation, contrast, and edge density), and text extraction that detects and crops unique text regions (Latin/Western) from frames.
 
 **Parameters:**
 
 | Flag | Description | Default |
 |---|---|---|
-| `-i <dir>` | Input directory containing video files (required) | `input` |
+| `-i <path>` | Input directory containing video files, or a path to a single video file (required) | `input` |
 | `-o <dir>` | Output directory for extracted frames | `output` |
 | `-f <path>` | FFmpeg path | `bin/ffmpeg.exe` (Win) / `bin/ffmpeg` (Linux) |
 | `--image <N>` | Extract N equally-spaced frames per video | |
 | `--image-detect` | Auto-detect visually striking frames (max 100 per video) | |
-| `--mosaic <N>` | Create a mosaic of N time-distributed striking photos (requires `--image-detect`) | |
+| `--mosaic <N> [P]` | Create a mosaic of N time-distributed striking photos, optionally starting from striking-frame position P (requires `--image-detect`) | |
 | `--extract-text` | Extract unique text crops from frames (Latin/Western text) | |
 | `-h` | Show help | |
 
 **Modes:**
 * **`--image N`:** Extracts exactly N frames spaced equally across the video duration. Fast — just FFmpeg seeks.
 * **`--image-detect`:** Samples up to 500 candidate frames, then scores each one with OpenCV on 4 metrics (sharpness, color saturation, contrast, edge density). Keeps the top 100 most visually striking frames.
-* **`--mosaic N`:** Creates a 1920×1080 mosaic JPG from N time-distributed striking photos (requires `--image-detect`). Picks photos evenly spread from earliest to latest. Layout: N=1 fills the canvas, N=2 splits into two equal halves (earliest left, latest right), N≥3 uses a hero image on the left half with the remaining N−1 images stacked vertically on the right. If N exceeds available frames, it clamps to whatever was detected.
+* **`--mosaic N [P]`:** Creates a 1920×1080 mosaic JPG from N time-distributed striking photos (requires `--image-detect`). `P` is optional and is a 1-indexed start position within the detected striking frames; only frames from position `P` onward are considered. Picks photos evenly spread from the eligible range. Layout: N=1 fills the canvas, N=2 splits into two equal halves (earliest left, latest right).
 * **`--extract-text`:** Samples frames across the video, detects text regions using MSER (Maximally Stable Extremal Regions), groups nearby characters into text blocks, and crops only the text rectangles. Deduplicates crops so each saved image contains unique text not seen in previous frames. Ideal for extracting subtitles, dialogue boxes, book pages, UI text, etc.
 * All modes can be used **simultaneously**. Output goes into separate subdirectories.
 
@@ -201,8 +201,10 @@ output/
 extract.exe --image 10
 extract.exe --image-detect
 extract.exe --image-detect --mosaic 3
+extract.exe --image-detect --mosaic 4 96
 extract.exe --extract-text
 extract.exe --image 5 --image-detect --mosaic 4 --extract-text -i my_videos -o my_frames
+extract.exe --image-detect --mosaic 4 96 -i "input\clip.mp4" -o output
 extract.exe --image 20 -i recordings -o thumbnails -f bin\ffmpeg.exe
 ```
 ```bash
@@ -210,8 +212,10 @@ extract.exe --image 20 -i recordings -o thumbnails -f bin\ffmpeg.exe
 ./extract --image 10
 ./extract --image-detect
 ./extract --image-detect --mosaic 3
+./extract --image-detect --mosaic 4 96
 ./extract --extract-text
 ./extract --image 5 --image-detect --mosaic 4 --extract-text -i my_videos -o my_frames
+./extract --image-detect --mosaic 4 96 -i input/clip.mp4 -o output
 ```
 
 ---
