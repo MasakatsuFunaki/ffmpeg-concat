@@ -19,7 +19,7 @@ def main():
         abort(f"Must be on 'master' branch (currently on '{branch}')")
 
     # Get the latest version tag
-    tags, _ = run("git tag -l 'v[0-9]*.[0-9]*.[0-9]*' --sort=-v:refname")
+    tags, _ = run('git tag -l "v[0-9]*.[0-9]*.[0-9]*" --sort=-v:refname')
 
     if not tags:
         new_tag = "v1.0.0"
