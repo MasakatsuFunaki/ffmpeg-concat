@@ -42,42 +42,48 @@ concat_videos.exe -i my_clips -o merged
 
 ### transcode
 
-Concatenates (if multiple files) and re-encodes MP4 files to **AV1** format. Automatically detects the best available encoder: NVIDIA NVENC GPU → SVT-AV1 CPU → libaom CPU.
+Accepts a single MP4 file or a directory of MP4 files. If a directory is given, concatenates all files first, then re-encodes. Supports **AV1** and **H.264** output. Automatically detects the best available AV1 encoder when no encoder is specified: NVIDIA NVENC GPU → SVT-AV1 CPU → libaom CPU.
 
 **Parameters:**
 
 | Flag | Description | Default |
 |---|---|---|
-| `-i <dir>` | Input directory | `input` |
-| `-o <dir>` | Output directory | `output` |
+| `-i <path>` | Input file or directory containing MP4 files (required) | |
+| `-o <dir>` | Output directory (required) | |
 | `-f <path>` | FFmpeg path | `bin/ffmpeg.exe` (Win) / `bin/ffmpeg` (Linux) |
 | `-q <0-51>` | Quality / CRF (lower = better) | `30` |
 | `-p <preset>` | Encoder preset | auto |
-| `-e <encoder>` | Force encoder (`av1_nvenc`, `libsvtav1`, `libaom-av1`) | auto-detect |
+| `-e <encoder>` | Force encoder (`av1_nvenc`, `libsvtav1`, `libaom-av1`, `h264_nvenc`, `libx264`). Auto-detects AV1 if empty | auto-detect |
 | `-h` | Show help | |
 
 **Presets by encoder:**
-* `av1_nvenc` — `p1` (fastest) to `p7` (best quality), default: `p4`
+* `av1_nvenc` / `h264_nvenc` — `p1` (fastest) to `p7` (best quality), default: `p4`
 * `libsvtav1` — `0` (slowest) to `13` (fastest), default: `6`
 * `libaom-av1` — `0` (slowest) to `8` (fastest), default: `4`
+* `libx264` — `ultrafast` to `veryslow`, default: `medium`
 
 **Examples:**
 ```bat
 # Windows
-transcode.exe
-transcode.exe -q 25
-transcode.exe -e av1_nvenc -p p7 -q 25
 transcode.exe -i raw_clips -o encoded
+transcode.exe -i raw_clips -o encoded -q 25
+transcode.exe -i raw_clips -o encoded -e av1_nvenc -p p7 -q 25
+transcode.exe -i raw_clips -o encoded -e h264_nvenc -q 23
+transcode.exe -i raw_clips -o encoded -e h264_nvenc -p p7 -q 20
+transcode.exe -i "input\clip.mp4" -o encoded -e h264_nvenc
 ```
 ```bash
 # Linux
-./transcode
-./transcode -q 25
-./transcode -e av1_nvenc -p p7 -q 25
 ./transcode -i raw_clips -o encoded
+./transcode -i raw_clips -o encoded -q 25
+./transcode -i raw_clips -o encoded -e av1_nvenc -p p7 -q 25
+./transcode -i raw_clips -o encoded -e h264_nvenc -q 23
+./transcode -i input/clip.mp4 -o encoded -e h264_nvenc
 ```
 
-**Note:** `av1_nvenc` requires an NVIDIA RTX 4000 series (Ada Lovelace) or newer GPU.
+**Notes:**
+* `av1_nvenc` requires an NVIDIA RTX 4000 series (Ada Lovelace) or newer GPU.
+* `h264_nvenc` requires any NVIDIA GPU with NVENC support (GTX 600 series or newer).
 
 ---
 
