@@ -238,16 +238,19 @@ This will build, copy artifacts to `build/release/<os>/`, switch to `master`, pu
 
 ## Building from Source
 
+> **First-time builds compile ffmpeg from source** (~20–60 min) via the local Conan recipe in [`recipes/ffmpeg/`](recipes/ffmpeg/). The CMake bootstrap runs `conan create recipes/ffmpeg` and `conan install .` automatically. The resulting `ffmpeg` binary — with `libx264`, `libsvtav1`, `libaom`, `h264_nvenc`, and `av1_nvenc` enabled — is cached in your Conan home; subsequent builds are fast. The binary gets copied into `bin/` so the C++ tools find it at the expected `FFMPEG_DEFAULT_PATH`.
+
 ### Windows
 
 **Prerequisites:** Visual Studio 2022, CMake 3.15+, Conan 2.x
 
 ```bat
 python switch_build.py
-conan install . --output-folder=build --build=missing
 cmake --preset conan-default
 cmake --build build --config Release
 ```
+
+The very first `cmake --preset` invocation triggers Conan to build ffmpeg + libx264 + libsvtav1 + libaom from source. Conan pulls NASM and MSYS2 as `tool_requires` — no manual install needed.
 
 **Debug build:**
 ```bat
@@ -263,11 +266,10 @@ ctest --test-dir build --build-config Release --output-on-failure
 
 ### Linux
 
-**Prerequisites:** GCC 9+, CMake 3.15+, Conan 2.x (`pip install conan`), `curl`, `tar`
+**Prerequisites:** GCC 9+, CMake 3.15+, Conan 2.x (`pip install conan`)
 
 ```bash
 python3 switch_build.py
-conan install . --output-folder=build_linux --build=missing
 cmake --preset conan-release
 cmake --build --preset conan-release
 ```
