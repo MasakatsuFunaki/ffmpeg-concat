@@ -1,0 +1,254 @@
+name: CI & Release
+
+on:
+  push:
+    branches: [main]
+    tags: ["v*.*.*"]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: Build & Test (${{ matrix.os_label }})
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 120
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: ubuntu-24.04
+            os_label: linux-x64
+            preset: conan-linux-release
+            binary_dir: build/Release
+            install_dir: install/linux
+            conan_home: ~/.conan2
+          - runner: windows-2022
+            os_label: windows-x64
+            preset: conan-windows-release
+            binary_dir: build
+            install_dir: install/win
+            conan_home: D:/.conan2
+    env:
+      CONAN_HOME: ${{ matrix.conan_home }}
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install Conan 2
+        shell: bash
+        run: |
+          python -m pip install --upgrade pip "conan>=2.4,<3"
+          conan --version
+
+      - name: Refresh apt index (Linux)
+        if: runner.os == 'Linux'
+        run: sudo apt-get update
+
+      - name: Cache Conan packages
+        uses: actions/cache@v4
+        with:
+          path: ${{ matrix.conan_home }}
+          key: conan-${{ runner.os }}-${{ hashFiles('conanfile.py', 'external/ffmpeg/conanfile.py', 'external/ffmpeg/conandata.yml') }}
+          restore-keys: |
+            conan-${{ runner.os }}-
+
+      - name: Install Conan dependencies
+        shell: bash
+        run: |
+          rm -f CMakeUserPresets.json
+          conan profile detect --force
+          conan export external/ffmpeg
+          if [ "${RUNNER_OS}" = "Linux" ]; then
+            conan install . --build=missing \
+              -c tools.system.package_manager:mode=install \
+              -c tools.system.package_manager:sudo=True
+          else
+            conan install . --build=missing
+          fi
+          conan cache clean "*" -b -s -t
+
+      - name: Configure CMake
+        shell: bash
+        run: cmake --preset ${{ matrix.preset }} -DBUILD_TESTING=ON
+
+      - name: Build Release
+        shell: bash
+        run: cmake --build --preset ${{ matrix.preset }} --parallel
+
+      - name: Run Unit Tests (UT) & Component Tests (CT)
+        shell: bash
+        run: |
+          ctest --preset ${{ matrix.preset }} -L UT --output-on-failure --timeout 300
+          ctest --preset ${{ matrix.preset }} -L CT --output-on-failure --timeout 300
+
+      - name: Install deliverables (Linux)
+        if: runner.os == 'Linux'
+        shell: bash
+        run: cmake --install ${{ matrix.binary_dir }} --config Release --strip
+
+      - name: Install deliverables (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: cmake --install ${{ matrix.binary_dir }} --config Release
+
+      - name: Verify installed binaries & runtime dependencies (Linux)
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          set -euo pipefail
+          for tool in concat_videos transcode cut split extract; do
+            bin="${{ matrix.install_dir }}/${tool}"
+            echo "=== Verifying ${bin} ==="
+            test -x "${bin}"
+            "${bin}" --help > /dev/null
+            ldd_out="$(ldd "${bin}")"
+            echo "${ldd_out}"
+            if echo "${ldd_out}" | grep -q "not found"; then
+              echo "ERROR: Unresolved shared library in ${bin}"
+              exit 1
+            fi
+            bad_deps="$(echo "${ldd_out}" | awk 'NF {print $1}' | grep -Ev '^(linux-vdso\.so|(.*/)?ld-linux|libc\.so|libm\.so|libstdc\+\+\.so|libgcc_s\.so|libpthread\.so|libdl\.so|librt\.so)' || true)"
+            if [ -n "${bad_deps}" ]; then
+              echo "ERROR: Non-portable shared library dependencies in ${bin}:"
+              echo "${bad_deps}"
+              exit 1
+            fi
+          done
+
+      - name: Verify installed binaries & runtime dependencies (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $dumpbin = Get-Command dumpbin.exe -ErrorAction SilentlyContinue | Select-Object -ExpandProperty Source
+          if (-not $dumpbin) {
+            $vswhere = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe"
+            $vsPath = & $vswhere -latest -products * -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath
+            $dumpbin = Get-ChildItem -Path "$vsPath\VC\Tools\MSVC" -Filter dumpbin.exe -Recurse |
+              Where-Object { $_.FullName -match 'Hostx64\\x64\\dumpbin\.exe$' } |
+              Select-Object -First 1 -ExpandProperty FullName
+          }
+          if (-not $dumpbin) {
+            throw "dumpbin.exe not found"
+          }
+
+          $allowedPattern = '^(api-ms-win-[\w-]+|ext-ms-win-[\w-]+|msvcp140(_\w+)?|vcruntime140(_\w+)?|concrt140|ucrtbase|kernel32|kernelbase|ntdll|user32|gdi32|advapi32|shell32|shlwapi|ole32|oleaut32|combase|comdlg32|comctl32|imm32|ws2_32|wsock32|secur32|bcrypt|bcryptprimitives|crypt32|ncrypt|psapi|mfplat|mf|mfuuid|mfreadwrite|evr|msvfw32|avifil32|avicap32|winmm|synchronization|rpcrt4|iphlpapi|netapi32|userenv|version|dbghelp|dxgi|d3d11|cfgmgr32|powrprof|setupapi)\.dll$'
+
+          foreach ($tool in @('concat_videos', 'transcode', 'cut', 'split', 'extract')) {
+            $exe = "${{ matrix.install_dir }}/$tool.exe"
+            Write-Host "=== Verifying $exe ==="
+            if (-not (Test-Path $exe)) {
+              throw "Missing installed executable: $exe"
+            }
+            & $exe --help | Out-Null
+            if ($LASTEXITCODE -ne 0) {
+              throw "$exe --help exited with code $LASTEXITCODE"
+            }
+
+            $out = & $dumpbin /dependents $exe
+            if ($LASTEXITCODE -ne 0) {
+              throw "dumpbin failed on $exe"
+            }
+            $inDeps = $false
+            $dlls = @()
+            foreach ($line in $out) {
+              if ($line -match 'Image has the following.*dependencies:') {
+                $inDeps = $true
+                continue
+              }
+              if ($line -match '^\s*Summary\b') {
+                $inDeps = $false
+                break
+              }
+              if ($inDeps -and $line -match '^\s+(\S+\.dll)\s*$') {
+                $dlls += $Matches[1]
+              }
+            }
+            if ($dlls.Count -eq 0) {
+              throw "Could not parse DLL dependencies from dumpbin output for $exe"
+            }
+            Write-Host ("Dependencies: " + ($dlls -join ', '))
+            $unexpected = $dlls | Where-Object { $_ -notmatch $allowedPattern }
+            if ($unexpected) {
+              throw "Unexpected non-OS/CRT DLL dependencies in ${exe}: $($unexpected -join ', ')"
+            }
+          }
+
+      - name: Package release archive & SHA-256 (Linux)
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          set -euo pipefail
+          VERSION="${GITHUB_REF_NAME//\//-}"
+          ARCHIVE="ffmpeg-tools-${VERSION}-linux-x64.tar.gz"
+          (cd "${{ matrix.install_dir }}" && tar -czf "${GITHUB_WORKSPACE}/${ARCHIVE}" *)
+          sha256sum "${ARCHIVE}" > "${ARCHIVE}.sha256"
+          ls -lh "${ARCHIVE}" "${ARCHIVE}.sha256"
+          cat "${ARCHIVE}.sha256"
+
+      - name: Package release archive & SHA-256 (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $version = $env:GITHUB_REF_NAME -replace '/', '-'
+          $archive = "ffmpeg-tools-$version-windows-x64.zip"
+          Compress-Archive -Path "${{ matrix.install_dir }}/*" -DestinationPath $archive -Force
+          $hash = (Get-FileHash -Path $archive -Algorithm SHA256).Hash.ToLowerInvariant()
+          [System.IO.File]::WriteAllText((Join-Path $PWD "$archive.sha256"), "$hash  $archive`n")
+          Get-Item $archive, "$archive.sha256" | Format-Table Name, Length -AutoSize
+          Get-Content "$archive.sha256"
+
+      - name: Upload release artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ffmpeg-tools-${{ matrix.os_label }}
+          path: |
+            ffmpeg-tools-*-${{ matrix.os_label }}.*
+          if-no-files-found: error
+
+  release:
+    name: Publish GitHub Release
+    needs: build
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+
+    steps:
+      - name: Download build artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: release_assets
+          merge-multiple: true
+
+      - name: Combine SHA256SUMS.txt
+        shell: bash
+        run: |
+          set -euo pipefail
+          ls -lh release_assets/
+          cat release_assets/*.sha256 > release_assets/SHA256SUMS.txt
+          rm -f release_assets/*.sha256
+          (cd release_assets && sha256sum -c SHA256SUMS.txt)
+          ls -lh release_assets/
+          cat release_assets/SHA256SUMS.txt
+
+      - name: Publish GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          generate_release_notes: true
+          fail_on_unmatched_files: true
+          files: |
+            release_assets/ffmpeg-tools-${{ github.ref_name }}-windows-x64.zip
+            release_assets/ffmpeg-tools-${{ github.ref_name }}-linux-x64.tar.gz
+            release_assets/SHA256SUMS.txt

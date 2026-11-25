@@ -1,0 +1,28 @@
+# Build, install, and CMake/Conan generated outputs
+build/
+build_linux/
+install/
+out/
+CMakeUserPresets.json
+
+# Python bytecode caches
+__pycache__/
+*.py[cod]
+
+# Local workspace staging & sample media directories
+/bin/
+/input/
+/output/
+
+# Local agent configurations & scratch backups
+AGENTS.md
+CLAUDE.md
+.claude/
+.gemini/
+.migration_backup/
+
+# IDE & OS metadata
+.vs/
+.idea/
+Thumbs.db
+.DS_Store
