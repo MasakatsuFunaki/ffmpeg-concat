@@ -1,1 +1,1 @@
-add_test_target(test_cut LIBS cut_lib LABELS CT)
+add_test_target(test_cut LIBS cut_lib ${TEST_OPENCV_LIBS} LABELS CT)

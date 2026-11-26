@@ -1,15 +1,12 @@
 #pragma once
 
-// ---------------------------------------------------------------------------
-// av::remuxer – container surgery without re-encoding.
-//
-// Both operations copy compressed packets straight from input to output, so the
-// video is bit-identical and the cost is I/O rather than CPU. Cutting can only
-// start on a keyframe, so a segment's real start may precede the requested one.
-// ---------------------------------------------------------------------------
+// Stream-copy container operations (segment extraction and concatenation).
+// Packets are remuxed without re-encoding; cutting begins on the keyframe at
+// or before the requested start timestamp.
 
 #include <filesystem>
-#include <vector>
+#include <initializer_list>
+#include <span>
 
 namespace fs = std::filesystem;
 
@@ -17,15 +14,27 @@ class ProgressReporter;
 
 namespace av {
 
-// Copy [start_sec, end_sec) of `in` into `out`. end_sec < 0 means "to the end".
-// Returns true on success.
-bool copy_segment(const fs::path& in, const fs::path& out, double start_sec, double end_sec);
+// Copies [start_sec, end_sec) of `in` into `out` via stream copy.
+// end_sec < 0 copies through the end of the file. Returns true on success.
+[[nodiscard]] bool copy_segment(const fs::path& in,
+                                const fs::path& out,
+                                double start_sec,
+                                double end_sec);
 
-// Copy `inputs` into `out` back to back, shifting each file's timestamps to
-// continue from the previous one. Every input must carry the same codecs and
-// parameters, which is what stream copying requires. Progress is reported
-// against total_sec when it is > 0. Returns true on success.
-bool concat_copy(const std::vector<fs::path>& inputs, const fs::path& out,
-                 ProgressReporter& reporter, double total_sec);
+// Concatenates `inputs` into `out` via stream copy, shifting timestamps across
+// segment boundaries. Every input must share compatible codecs and parameters.
+// Reports progress against `total_sec` when > 0. Returns true on success.
+[[nodiscard]] bool concat_copy(std::span<const fs::path> inputs,
+                               const fs::path& out,
+                               ProgressReporter& reporter,
+                               double total_sec);
+
+[[nodiscard]] inline bool concat_copy(std::initializer_list<fs::path> inputs,
+                                      const fs::path& out,
+                                      ProgressReporter& reporter,
+                                      double total_sec) {
+    return concat_copy(std::span<const fs::path>{inputs.begin(), inputs.size()},
+                       out, reporter, total_sec);
+}
 
 }  // namespace av

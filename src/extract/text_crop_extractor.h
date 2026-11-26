@@ -1,27 +1,29 @@
 #pragma once
 
-// ---------------------------------------------------------------------------
-// TextCropExtractor – FrameExtractor Strategy that samples one frame per second
-// into the "text" subdir, detects text regions, runs each candidate crop
-// through the CropFilter chain, deduplicates the survivors and writes them as
-// text_%04d.jpg. Owns the ordered CropFilter chain so the original short-circuit
-// evaluation order is preserved.
-// ---------------------------------------------------------------------------
+// TextCropExtractor -- FrameExtractor Strategy that samples frames into the
+// "text" subdir, detects text regions, runs the CropFilter chain, deduplicates
+// survivors, and writes text_%04d.jpg. Uses PIMPL to insulate callers from
+// OpenCV headers.
 
 #include "extract/frame_extractor.h"
-#include "extract/crop_filter.h"
-#include "extract/text_region_detector.h"
 
 #include <memory>
-#include <vector>
 
-class TextCropExtractor : public FrameExtractor {
+class TextCropExtractor final : public FrameExtractor {
 public:
     TextCropExtractor();
-    bool run(const Ffmpeg& ff, const fs::path& video, const fs::path& video_out_dir) override;
+    ~TextCropExtractor() override;
+
+    TextCropExtractor(const TextCropExtractor&) = delete;
+    TextCropExtractor& operator=(const TextCropExtractor&) = delete;
+    TextCropExtractor(TextCropExtractor&&) noexcept;
+    TextCropExtractor& operator=(TextCropExtractor&&) noexcept;
+
+    [[nodiscard]] bool run(const Ffmpeg& ff,
+                           const fs::path& video,
+                           const fs::path& video_out_dir) override;
 
 private:
-    bool extract(const Ffmpeg& ff, const fs::path& video_file, const fs::path& output_dir);
-    std::vector<std::unique_ptr<CropFilter>> filters_;
-    TextRegionDetector detector_;
+    struct Impl;
+    std::unique_ptr<Impl> impl_;
 };

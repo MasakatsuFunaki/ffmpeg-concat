@@ -3,46 +3,61 @@
 #include "av/av_capabilities.h"
 #include "av/media_probe.h"
 #include "av/transcoder.h"
-#include "ffmpeg/progress_reporter.h"
+#include "core/format_util.h"
+#include "core/scoped_handle.h"
 #include "encode/encode_plan.h"
 #include "encode/encoder_catalog.h"
-
-#include <iomanip>
-#include <sstream>
-#include <utility>
+#include "ffmpeg/progress_reporter.h"
 
 #include <boost/program_options.hpp>
 
+#include <cstddef>
+#include <format>
+#include <string>
+#include <system_error>
+#include <utility>
+#include <vector>
+
 namespace po = boost::program_options;
+
+namespace {
+constexpr int kMinCrf = 0;
+constexpr int kMaxCrf = 51;
+constexpr int kDefaultCrf = 30;
+}  // namespace
 
 std::string TranscodeApp::name() const { return "Transcode Video"; }
 
 void TranscodeApp::define_options(po::options_description& desc) {
     desc.add_options()
-        ("input,i",  po::value<std::string>()->required(),          "Input file or directory containing MP4 files")
-        ("output,o", po::value<std::string>()->required(),         "Output directory for transcoded video")
-        ("crf,q",    po::value<int>()->default_value(30),                       "Quality (0=best, 51=worst, default: 30)")
-        ("preset,p", po::value<std::string>()->default_value(""),               "Encoder preset (av1_nvenc/h264_nvenc: p1-p7, libsvtav1: 0-13, libx264: ultrafast-veryslow, libaom-av1: 0-8)")
-        ("encoder,e", po::value<std::string>()->default_value(""),              "Force encoder (av1_nvenc, libsvtav1, libaom-av1, h264_nvenc, libx264). Auto-detects AV1 if empty")
+        ("input,i",   po::value<std::string>()->required(),              "Input file or directory containing MP4 files")
+        ("output,o",  po::value<std::string>()->required(),              "Output directory for transcoded video")
+        ("crf,q",     po::value<int>()->default_value(kDefaultCrf),      "Quality (0=best, 51=worst, default: 30)")
+        ("preset,p",  po::value<std::string>()->default_value(""),       "Encoder preset (av1_nvenc/h264_nvenc: p1-p7, libsvtav1: 0-13, libx264: ultrafast-veryslow, libaom-av1: 0-8)")
+        ("encoder,e", po::value<std::string>()->default_value(""),       "Force encoder (av1_nvenc, libsvtav1, libaom-av1, h264_nvenc, libx264). Auto-detects AV1 if empty")
     ;
 }
 
 int TranscodeApp::execute(const po::variables_map& vm) {
-    fs::path input_path  = fs::absolute(vm["input"].as<std::string>());
-    fs::path output_dir  = fs::absolute(vm["output"].as<std::string>());
-    int crf              = vm["crf"].as<int>();
-    std::string preset   = vm["preset"].as<std::string>();
-    std::string encoder  = vm["encoder"].as<std::string>();
+    const fs::path input_path = fs::absolute(vm["input"].as<std::string>());
+    const fs::path output_dir = fs::absolute(vm["output"].as<std::string>());
+    const int crf             = vm["crf"].as<int>();
+    std::string preset        = vm["preset"].as<std::string>();
+    std::string encoder       = vm["encoder"].as<std::string>();
 
-    bool input_is_file = fs::is_regular_file(input_path);
-    bool input_is_dir  = fs::is_directory(input_path);
+    if (crf < kMinCrf || crf > kMaxCrf) {
+        BOOST_LOG_TRIVIAL(error) << std::format(
+            "Error: CRF must be between {} and {} (got {}).", kMinCrf, kMaxCrf, crf);
+        return 1;
+    }
+
+    const bool input_is_file = fs::is_regular_file(input_path);
+    const bool input_is_dir  = fs::is_directory(input_path);
 
     if (!fs::exists(input_path) || (!input_is_file && !input_is_dir)) {
         BOOST_LOG_TRIVIAL(error) << "Error: Input path does not exist or is not a file/directory: " << input_path;
         return 1;
     }
-
-    fs::create_directories(output_dir);
 
     if (encoder.empty()) {
         BOOST_LOG_TRIVIAL(info) << "Detecting best AV1 encoder...";
@@ -51,25 +66,28 @@ int TranscodeApp::execute(const po::variables_map& vm) {
             BOOST_LOG_TRIVIAL(error) << "Error: No AV1 encoder found. This build has no usable AV1 encoder.";
             return 1;
         }
+    } else if (!av::encoder_exists(encoder)) {
+        BOOST_LOG_TRIVIAL(error) << std::format(
+            "Error: Unknown or unavailable encoder: '{}'.", encoder);
+        return 1;
     }
-    BOOST_LOG_TRIVIAL(info) << "Using encoder: " << encoder;
+    BOOST_LOG_TRIVIAL(info) << std::format("Using encoder: {}", encoder);
 
     std::vector<fs::path> files_to_encode;
-
     if (input_is_file) {
         files_to_encode.push_back(input_path);
-        BOOST_LOG_TRIVIAL(info) << "Input is a single file: " << input_path.filename().string();
+        BOOST_LOG_TRIVIAL(info) << std::format(
+            "Input is a single file: {}", input_path.filename().string());
     } else {
         files_to_encode = media::collect_mp4_files(input_path);
-
         if (files_to_encode.empty()) {
             BOOST_LOG_TRIVIAL(error) << "Error: No MP4 files found in " << input_path;
             return 1;
         }
 
-        BOOST_LOG_TRIVIAL(info) << "Found " << files_to_encode.size() << " MP4 file(s):";
-        for (const auto& f : files_to_encode) {
-            BOOST_LOG_TRIVIAL(info) << "  - " << f.filename().string();
+        BOOST_LOG_TRIVIAL(info) << std::format("Found {} MP4 file(s):", files_to_encode.size());
+        for (const auto& file : files_to_encode) {
+            BOOST_LOG_TRIVIAL(info) << std::format("  - {}", file.filename().string());
         }
 
         if (files_to_encode.size() == 1) {
@@ -79,69 +97,79 @@ int TranscodeApp::execute(const po::variables_map& vm) {
         }
     }
 
-    fs::path output_file = output_dir / ("transcoded_" + media::current_timestamp() + ".mp4");
+    fs::create_directories(output_dir);
+
+    const std::string timestamp = media::current_timestamp();
+    fs::path output_file = output_dir / std::format("transcoded_{}.mp4", timestamp);
+    for (std::size_t suffix = 1; fs::exists(output_file); ++suffix) {
+        output_file = output_dir / std::format("transcoded_{}_{}.mp4", timestamp, suffix);
+    }
 
     const bool use_concat_filter = files_to_encode.size() > 1;
-
     double total_duration_sec = 0.0;
     std::vector<av::FrameRate> frame_rates;
-    for (const auto& f : files_to_encode) {
-        av::MediaInfo info = av::probe(f);
-        if (info.duration_sec > 0) total_duration_sec += info.duration_sec;
-        // Only relevant when segments get joined; a lone file cannot be "mixed".
-        if (use_concat_filter) frame_rates.push_back(info.frame_rate);
+    if (use_concat_filter) {
+        frame_rates.reserve(files_to_encode.size());
     }
-    if (total_duration_sec > 0) {
-        int total_h = static_cast<int>(total_duration_sec) / 3600;
-        int total_m = (static_cast<int>(total_duration_sec) % 3600) / 60;
-        int total_s = static_cast<int>(total_duration_sec) % 60;
-        std::ostringstream dur_oss;
-        dur_oss << std::setfill('0') << std::setw(2) << total_h << ":"
-                << std::setfill('0') << std::setw(2) << total_m << ":"
-                << std::setfill('0') << std::setw(2) << total_s;
-        BOOST_LOG_TRIVIAL(info) << "Total duration: " << dur_oss.str();
+
+    for (const auto& file : files_to_encode) {
+        const av::MediaInfo info = av::probe(file);
+        if (info.duration_sec > 0.0) {
+            total_duration_sec += info.duration_sec;
+        }
+        // Only relevant when segments get joined; a lone file cannot be mixed.
+        if (use_concat_filter) {
+            frame_rates.push_back(info.frame_rate);
+        }
+    }
+
+    if (total_duration_sec > 0.0) {
+        BOOST_LOG_TRIVIAL(info) << std::format(
+            "Total duration: {}", core::format_hms(total_duration_sec));
     }
 
     BOOST_LOG_TRIVIAL(info) << "Encoding with " << encoder << ": " << output_file;
 
-    if (files_to_encode.empty()) {
-        BOOST_LOG_TRIVIAL(error) << "Error: run_encode called with no input files.";
-        return 1;
-    }
-
-    EncodePlan plan;
-    plan.inputs  = files_to_encode;
-    plan.output  = output_file;
-    plan.encoder = encoder;
-    plan.crf     = crf;
-    plan.preset  = preset;
-
-    // Decoding is the bottleneck for modern codecs — software AV1 in particular
-    // is several times slower than the NVENC encode it feeds. CUDA availability
-    // is a property of the host, not of any one file, so probe it once.
-    plan.hwaccel_cuda = av::can_use_hwaccel("cuda");
-    BOOST_LOG_TRIVIAL(info) << (plan.hwaccel_cuda
+    // CUDA availability is a host property, so probe it once per run.
+    const bool hwaccel_cuda = av::can_use_hwaccel("cuda");
+    BOOST_LOG_TRIVIAL(info) << (hwaccel_cuda
         ? "CUDA available: decoding on the GPU."
         : "CUDA unavailable: decoding in software.");
 
-    plan.target_fps = lowest_fps_if_mixed(frame_rates);
-    if (plan.target_fps.known()) {
-        BOOST_LOG_TRIVIAL(info) << "Mixed frame rates; normalizing every segment to "
-                                << plan.target_fps.value() << " fps (the lowest).";
+    const av::FrameRate target_fps = lowest_fps_if_mixed(frame_rates);
+    if (target_fps.known()) {
+        BOOST_LOG_TRIVIAL(info) << std::format(
+            "Mixed frame rates; normalizing every segment to {} fps (the lowest).",
+            target_fps.value());
     }
 
-    av::TranscodeRequest request = build_request(plan);
+    const EncodePlan plan{
+        .inputs = std::move(files_to_encode),
+        .output = output_file,
+        .encoder = std::move(encoder),
+        .crf = crf,
+        .preset = std::move(preset),
+        .hwaccel_cuda = hwaccel_cuda,
+        .target_fps = target_fps,
+    };
+
+    const av::TranscodeRequest request = build_request(plan);
     BOOST_LOG_TRIVIAL(info) << "Filter graph: " << request.filter_description;
 
-    IndicatorsProgressReporter rep;
-    bool encode_ok = av::transcode(request, rep, total_duration_sec);
+    auto remove_partial_output = core::make_scope_guard([&output_file]() noexcept {
+        std::error_code ec;
+        fs::remove(output_file, ec);
+    });
 
-    if (encode_ok) {
-        media::log_output_size(output_file);
-        return 0;
+    IndicatorsProgressReporter rep;
+    const bool encode_ok = av::transcode(request, rep, total_duration_sec);
+    if (!encode_ok) {
+        return 1;
     }
 
-    return 1;
+    remove_partial_output.dismiss();
+    media::log_output_size(output_file);
+    return 0;
 }
 
 #ifndef TESTING_NO_MAIN

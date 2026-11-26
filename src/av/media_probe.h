@@ -1,12 +1,7 @@
 #pragma once
 
-// ---------------------------------------------------------------------------
-// media_probe – read a container's properties in-process.
-//
-// Replaces the old "spawn `ffmpeg -i` and scrape stderr" probe: libavformat
-// hands back the same numbers as structured data, so there is nothing to parse
-// and no locale to defend against.
-// ---------------------------------------------------------------------------
+// In-process container probing via libavformat returning structured metadata
+// without spawning an external process or parsing text output.
 
 #include <filesystem>
 #include <string>
@@ -15,32 +10,37 @@ namespace fs = std::filesystem;
 
 namespace av {
 
-// An exact frame rate, kept as the rational libav reports rather than a double.
-// Decimals are both lossy (30000/1001 does not round-trip) and unsafe to put in
-// a filter string: libavfilter parses numbers through the C locale, which any
-// library in the process can switch to comma-decimal.
+// Exact frame rate preserved as a rational (e.g. 30000/1001) so filter strings
+// stay lossless and immune to locale-dependent decimal formatting.
 struct FrameRate {
+    static constexpr double kUnknownValue = -1.0;
+
     int num = 0;
     int den = 0;
 
-    bool known() const { return num > 0 && den > 0; }
-    double value() const { return known() ? static_cast<double>(num) / den : -1.0; }
+    [[nodiscard]] constexpr bool known() const noexcept { return num > 0 && den > 0; }
+    [[nodiscard]] constexpr double value() const noexcept {
+        return known() ? static_cast<double>(num) / den : kUnknownValue;
+    }
+    [[nodiscard]] constexpr bool operator==(const FrameRate&) const noexcept = default;
 };
 
 struct MediaInfo {
-    bool ok = false;              // false => the file could not be opened/parsed
-    double duration_sec = -1.0;   // -1.0 when the container declares no duration
-    FrameRate frame_rate;         // average rate of the best video stream
+    bool ok = false;             // false when the file could not be opened/parsed
+    double duration_sec = -1.0;  // -1.0 when the container declares no duration
+    FrameRate frame_rate;        // average rate of the best video stream
     int width = 0;
     int height = 0;
     bool has_video = false;
     bool has_audio = false;
-    std::string video_codec;      // e.g. "h264", "av1"
+    std::string video_codec;     // e.g. "h264", "av1"
     std::string audio_codec;
+
+    [[nodiscard]] bool operator==(const MediaInfo&) const = default;
 };
 
-// Open `file` and report what it contains. Never throws; a failure to open
-// returns a MediaInfo with ok == false and the numeric fields left negative.
-MediaInfo probe(const fs::path& file);
+// Opens `file` and reports its container and stream properties. Never throws;
+// returns a MediaInfo with ok == false on failure.
+[[nodiscard]] MediaInfo probe(const fs::path& file);
 
 }  // namespace av

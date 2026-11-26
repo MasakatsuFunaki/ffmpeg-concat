@@ -1,106 +1,165 @@
 #include "extract/text_region_detector.h"
 
 #include <algorithm>
+#include <cstddef>
+#include <cstdint>
 #include <cstdlib>
+#include <ranges>
+#include <tuple>
+#include <vector>
 
-#include <opencv2/imgproc.hpp>
 #include <opencv2/features2d.hpp>
+#include <opencv2/imgproc.hpp>
+
+namespace {
+
+constexpr int kChannelsGray = 1;
+constexpr int kChannelsBgr = 3;
+constexpr int kChannelsBgra = 4;
+
+constexpr int kMserDelta = 5;
+constexpr int kMserMinArea = 60;
+constexpr int kMserMaxArea = 14400;
+constexpr double kMserMaxVariation = 0.25;
+constexpr double kMserMinDiversity = 0.2;
+
+constexpr int kMinCharWidth = 5;
+constexpr int kMinCharHeight = 8;
+constexpr double kMaxCharRelativeSpan = 0.9;
+constexpr double kMinCharAspect = 0.1;
+constexpr double kMaxCharAspect = 10.0;
+constexpr double kMaxCharRelArea = 0.5;
+constexpr double kMinCharFillRatio = 0.1;
+constexpr double kMaxCharFillRatio = 0.95;
+
+constexpr int kVerticalGapDivisor = 2;
+constexpr int kCenterDivisor = 2;
+
+constexpr int kMinBlockWidth = 40;
+constexpr int kMinBlockHeight = 12;
+constexpr double kMinBlockAspect = 1.2;
+constexpr double kMaxBlockRelArea = 0.4;
+constexpr double kPadXFraction = 0.05;
+constexpr double kPadYFraction = 0.1;
+
+[[nodiscard]] cv::Mat to_grayscale(const cv::Mat& image) {
+    if (image.channels() == kChannelsGray) {
+        return image;
+    }
+
+    cv::Mat gray;
+    if (image.channels() == kChannelsBgr) {
+        cv::cvtColor(image, gray, cv::COLOR_BGR2GRAY);
+        return gray;
+    }
+    if (image.channels() == kChannelsBgra) {
+        cv::cvtColor(image, gray, cv::COLOR_BGRA2GRAY);
+        return gray;
+    }
+    return {};
+}
+
+}  // namespace
 
 std::vector<cv::Rect> TextRegionDetector::detect(const cv::Mat& image) const {
     std::vector<cv::Rect> result;
-    if (image.empty()) return result;
+    if (image.empty() || image.cols <= 0 || image.rows <= 0) {
+        return result;
+    }
 
-    cv::Mat gray;
-    cv::cvtColor(image, gray, cv::COLOR_BGR2GRAY);
+    const cv::Mat gray = to_grayscale(image);
+    if (gray.empty()) {
+        return result;
+    }
 
-    // Use MSER to detect text-like stable regions
-    auto mser = cv::MSER::create(
-        5,      // delta
-        60,     // min area
-        14400,  // max area
-        0.25,   // max variation
-        0.2     // min diversity
-    );
+    auto mser = cv::MSER::create(kMserDelta, kMserMinArea, kMserMaxArea,
+                                 kMserMaxVariation, kMserMinDiversity);
 
     std::vector<std::vector<cv::Point>> regions;
     std::vector<cv::Rect> bboxes;
     mser->detectRegions(gray, regions, bboxes);
+    if (bboxes.empty()) {
+        return result;
+    }
 
-    if (bboxes.empty()) return result;
-
-    // Filter MSER regions for text-like characteristics:
-    // - Aspect ratio: text regions are wider than tall (or at least not extremely tall/narrow)
-    // - Size: not too small, not too large relative to image
-    // - Stroke width consistency (approximated by area vs bounding box area ratio)
+    const double img_area =
+        static_cast<double>(image.cols) * static_cast<double>(image.rows);
+    const std::size_t region_count = std::min(bboxes.size(), regions.size());
     std::vector<cv::Rect> text_candidates;
-    double img_area = static_cast<double>(image.cols * image.rows);
+    text_candidates.reserve(region_count);
 
-    for (size_t i = 0; i < bboxes.size(); ++i) {
+    for (const std::size_t i : std::views::iota(std::size_t{0}, region_count)) {
         const cv::Rect& bb = bboxes[i];
-        if (bb.width < 5 || bb.height < 8) continue;
-        if (bb.width > image.cols * 0.9 && bb.height > image.rows * 0.9) continue;
+        if (bb.width < kMinCharWidth || bb.height < kMinCharHeight) {
+            continue;
+        }
+        if (static_cast<double>(bb.width) > static_cast<double>(image.cols) * kMaxCharRelativeSpan &&
+            static_cast<double>(bb.height) > static_cast<double>(image.rows) * kMaxCharRelativeSpan) {
+            continue;
+        }
 
-        double aspect = static_cast<double>(bb.width) / bb.height;
-        // Individual characters have aspect ratios roughly 0.2 to 2.0
-        if (aspect < 0.1 || aspect > 10.0) continue;
+        const double aspect = static_cast<double>(bb.width) / static_cast<double>(bb.height);
+        if (aspect < kMinCharAspect || aspect > kMaxCharAspect) {
+            continue;
+        }
 
-        // Area relative to image - skip very large regions
-        double rel_area = (bb.width * bb.height) / img_area;
-        if (rel_area > 0.5) continue;
+        const double bb_area = static_cast<double>(bb.width) * static_cast<double>(bb.height);
+        if (bb_area / img_area > kMaxCharRelArea) {
+            continue;
+        }
 
-        // Fill ratio: text characters have moderate fill
-        double fill_ratio = static_cast<double>(regions[i].size()) / (bb.width * bb.height);
-        if (fill_ratio < 0.1 || fill_ratio > 0.95) continue;
+        const double fill_ratio = static_cast<double>(regions[i].size()) / bb_area;
+        if (fill_ratio < kMinCharFillRatio || fill_ratio > kMaxCharFillRatio) {
+            continue;
+        }
 
         text_candidates.push_back(bb);
     }
 
-    if (text_candidates.empty()) return result;
+    if (text_candidates.empty()) {
+        return result;
+    }
 
-    // Group nearby text candidates into text blocks/lines using spatial clustering.
-    // Sort by y-coordinate first, then group by proximity.
-    std::sort(text_candidates.begin(), text_candidates.end(),
-              [](const cv::Rect& a, const cv::Rect& b) {
-                  return (a.y < b.y) || (a.y == b.y && a.x < b.x);
-              });
+    std::ranges::sort(text_candidates, [](const cv::Rect& a, const cv::Rect& b) noexcept {
+        return std::tie(a.y, a.x) < std::tie(b.y, b.x);
+    });
 
-    // Merge overlapping/nearby rectangles into text blocks
-    // Use a simple approach: iteratively merge rects that are close enough
     std::vector<cv::Rect> merged;
-    std::vector<bool> used(text_candidates.size(), false);
+    std::vector<std::uint8_t> used(text_candidates.size(), 0U);
 
-    for (size_t i = 0; i < text_candidates.size(); ++i) {
-        if (used[i]) continue;
+    for (const std::size_t i : std::views::iota(std::size_t{0}, text_candidates.size())) {
+        if (used[i] != 0U) {
+            continue;
+        }
 
         cv::Rect block = text_candidates[i];
-        used[i] = true;
+        used[i] = 1U;
         bool changed = true;
 
         while (changed) {
             changed = false;
-            for (size_t j = 0; j < text_candidates.size(); ++j) {
-                if (used[j]) continue;
+            for (const std::size_t j : std::views::iota(std::size_t{0}, text_candidates.size())) {
+                if (used[j] != 0U) {
+                    continue;
+                }
 
                 const cv::Rect& cand = text_candidates[j];
+                const int h_gap = std::max(block.height, cand.height);
+                const int v_gap = std::max(block.height, cand.height) / kVerticalGapDivisor;
 
-                // Check if candidate is close to current block
-                // Horizontal gap threshold: based on typical character spacing
-                int h_gap = std::max(block.height, cand.height);
-                int v_gap = std::max(block.height, cand.height) / 2;
-
-                bool h_close = (cand.x <= block.x + block.width + h_gap) &&
-                               (block.x <= cand.x + cand.width + h_gap);
-                bool v_close = std::abs((cand.y + cand.height / 2) -
-                                        (block.y + block.height / 2)) < v_gap;
+                const bool h_close = (cand.x <= block.x + block.width + h_gap) &&
+                                     (block.x <= cand.x + cand.width + h_gap);
+                const bool v_close =
+                    std::abs((cand.y + cand.height / kCenterDivisor) -
+                             (block.y + block.height / kCenterDivisor)) < v_gap;
 
                 if (h_close && v_close) {
-                    // Merge
-                    int x1 = std::min(block.x, cand.x);
-                    int y1 = std::min(block.y, cand.y);
-                    int x2 = std::max(block.x + block.width, cand.x + cand.width);
-                    int y2 = std::max(block.y + block.height, cand.y + cand.height);
+                    const int x1 = std::min(block.x, cand.x);
+                    const int y1 = std::min(block.y, cand.y);
+                    const int x2 = std::max(block.x + block.width, cand.x + cand.width);
+                    const int y2 = std::max(block.y + block.height, cand.y + cand.height);
                     block = cv::Rect(x1, y1, x2 - x1, y2 - y1);
-                    used[j] = true;
+                    used[j] = 1U;
                     changed = true;
                 }
             }
@@ -109,34 +168,29 @@ std::vector<cv::Rect> TextRegionDetector::detect(const cv::Mat& image) const {
         merged.push_back(block);
     }
 
-    // Final filtering: keep only blocks that look like text lines/paragraphs
     for (const auto& block : merged) {
-        double aspect = static_cast<double>(block.width) / block.height;
+        if (block.width < kMinBlockWidth || block.height < kMinBlockHeight) {
+            continue;
+        }
 
-        // Text blocks should be wider than tall (aspect > 1.5) or have minimum size
-        // Also accept shorter text blocks that have enough width
-        if (block.width < 40 || block.height < 12) continue;
+        const double aspect = static_cast<double>(block.width) / static_cast<double>(block.height);
+        if (aspect < kMinBlockAspect) {
+            continue;
+        }
 
-        // Text should be reasonably wide compared to its height
-        // Single words: aspect ~2-10, text lines: aspect ~5-50
-        // Allow some narrow blocks (subtitles can be aspect ~3)
-        if (aspect < 1.2) continue;
+        const double block_area =
+            static_cast<double>(block.width) * static_cast<double>(block.height);
+        if (block_area / img_area > kMaxBlockRelArea) {
+            continue;
+        }
 
-        // Skip blocks that are too large (probably not text)
-        double rel_area = static_cast<double>(block.width * block.height) / img_area;
-        if (rel_area > 0.4) continue;
-
-        // Add padding around the text block (5% of dimensions)
-        int pad_x = static_cast<int>(block.width * 0.05);
-        int pad_y = static_cast<int>(block.height * 0.1);
-        cv::Rect padded(
-            std::max(0, block.x - pad_x),
-            std::max(0, block.y - pad_y),
-            std::min(block.width + 2 * pad_x, image.cols - std::max(0, block.x - pad_x)),
-            std::min(block.height + 2 * pad_y, image.rows - std::max(0, block.y - pad_y))
-        );
-
-        result.push_back(padded);
+        const int pad_x = static_cast<int>(static_cast<double>(block.width) * kPadXFraction);
+        const int pad_y = static_cast<int>(static_cast<double>(block.height) * kPadYFraction);
+        const int x = std::max(0, block.x - pad_x);
+        const int y = std::max(0, block.y - pad_y);
+        const int w = std::min(block.width + pad_x + pad_x, image.cols - x);
+        const int h = std::min(block.height + pad_y + pad_y, image.rows - y);
+        result.emplace_back(x, y, w, h);
     }
 
     return result;

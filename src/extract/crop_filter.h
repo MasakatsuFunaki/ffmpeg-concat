@@ -1,37 +1,39 @@
 #pragma once
 
-// ---------------------------------------------------------------------------
-// CropFilter – Chain of Responsibility (GoF), reject-and-stop. Each concrete
-// filter computes its own metric from the grayscale crop and votes accept or
-// reject. The text extractor runs them in order Contrast -> EdgeDensity ->
-// ComponentCount and drops the crop on the first rejection, so the original
-// short-circuit evaluation is preserved exactly (later filters never run when
-// an earlier one rejects).
-// ---------------------------------------------------------------------------
+// CropFilter -- reject-and-stop Chain of Responsibility protocol over
+// single-channel grayscale candidate crops.
 
 #include <opencv2/core.hpp>
 
 class CropFilter {
 public:
-    virtual ~CropFilter() = default;
-    virtual bool accept(const cv::Mat& crop_gray) const = 0;
+    virtual ~CropFilter();
+
+    CropFilter(const CropFilter&) = delete;
+    CropFilter& operator=(const CropFilter&) = delete;
+
+    [[nodiscard]] virtual bool accept(const cv::Mat& crop_gray) const = 0;
+
+protected:
+    CropFilter() = default;
+    CropFilter(CropFilter&&) noexcept = default;
+    CropFilter& operator=(CropFilter&&) noexcept = default;
 };
 
-// Reject near-uniform patches (plain backgrounds): reject stddev < 25.0.
-class ContrastFilter : public CropFilter {
+// Rejects near-uniform patches with grayscale standard deviation below 25.0.
+class ContrastFilter final : public CropFilter {
 public:
-    bool accept(const cv::Mat& crop_gray) const override;
+    [[nodiscard]] bool accept(const cv::Mat& crop_gray) const override;
 };
 
-// Reject crops with too few edge pixels for text strokes: reject ratio < 0.05.
-class EdgeDensityFilter : public CropFilter {
+// Rejects crops whose Canny edge pixel fraction is below 0.05.
+class EdgeDensityFilter final : public CropFilter {
 public:
-    bool accept(const cv::Mat& crop_gray) const override;
+    [[nodiscard]] bool accept(const cv::Mat& crop_gray) const override;
 };
 
-// Reject crops with too few text-like connected components: reject
-// (num_components - 1) * 100 / cols < 1.0.
-class ComponentCountFilter : public CropFilter {
+// Rejects crops with fewer than 1.0 Otsu connected component per 100 px width.
+class ComponentCountFilter final : public CropFilter {
 public:
-    bool accept(const cv::Mat& crop_gray) const override;
+    [[nodiscard]] bool accept(const cv::Mat& crop_gray) const override;
 };

@@ -1,22 +1,25 @@
 #pragma once
 
-// ---------------------------------------------------------------------------
-// CropDeduplicator – plain class (deliberately NOT a pattern) that decides
-// whether a crop is visually distinct from a set of already-saved crops via a
-// resized normalized-correlation comparison. The similarity threshold is fixed
-// at construction (0.85 for striking frames, 0.92 for text crops).
-// ---------------------------------------------------------------------------
+// CropDeduplicator -- decides whether an image crop is visually distinct from
+// previously saved crops using resized normalized cross-correlation.
 
-#include <vector>
+#include <initializer_list>
+#include <span>
 
 #include <opencv2/core.hpp>
 
 class CropDeduplicator {
 public:
-    explicit CropDeduplicator(double threshold);
+    explicit CropDeduplicator(double threshold) noexcept;
 
-    // True when crop is visually different from all previously saved crops.
-    bool is_unique(const cv::Mat& crop, const std::vector<cv::Mat>& saved_crops) const;
+    // True when crop is non-empty and visually distinct from every saved crop.
+    [[nodiscard]] bool is_unique(const cv::Mat& crop,
+                                 std::span<const cv::Mat> saved_crops) const;
+
+    [[nodiscard]] bool is_unique(const cv::Mat& crop,
+                                 std::initializer_list<cv::Mat> saved_crops) const {
+        return is_unique(crop, std::span<const cv::Mat>{saved_crops.begin(), saved_crops.size()});
+    }
 
 private:
     double threshold_;

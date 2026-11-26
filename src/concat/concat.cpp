@@ -1,65 +1,86 @@
 #include "concat.h"
 
+#include "core/scoped_handle.h"
 #include "ffmpeg/progress_reporter.h"
-
-#include <iostream>
 
 #include <boost/program_options.hpp>
 
+#include <cstddef>
+#include <format>
+#include <functional>
+#include <numeric>
+#include <string>
+#include <system_error>
+
 namespace po = boost::program_options;
+
+namespace {
+constexpr std::size_t kMinConcatFiles = 2;
+}  // namespace
 
 std::string ConcatApp::name() const { return "Concat Videos"; }
 
 void ConcatApp::define_options(po::options_description& desc) {
     desc.add_options()
-        ("input,i",  po::value<std::string>()->required(),  "Input directory containing MP4 files")
+        ("input,i",  po::value<std::string>()->required(), "Input directory containing MP4 files")
         ("output,o", po::value<std::string>()->required(), "Output directory for concatenated video")
     ;
 }
 
 int ConcatApp::execute(const po::variables_map& vm) {
-    fs::path input_dir  = fs::absolute(vm["input"].as<std::string>());
-    fs::path output_dir = fs::absolute(vm["output"].as<std::string>());
+    const fs::path input_dir  = fs::absolute(vm["input"].as<std::string>());
+    const fs::path output_dir = fs::absolute(vm["output"].as<std::string>());
 
     if (!fs::exists(input_dir) || !fs::is_directory(input_dir)) {
         BOOST_LOG_TRIVIAL(error) << "Error: Input directory does not exist: " << input_dir;
         return 1;
     }
 
-    fs::create_directories(output_dir);
-
-    auto mp4_files = media::collect_mp4_files(input_dir);
-
-    if (mp4_files.size() < 2) {
-        BOOST_LOG_TRIVIAL(info) << "Found " << mp4_files.size()
-                  << " MP4 file(s). Need at least 2 files to concatenate.";
+    const auto mp4_files = media::collect_mp4_files(input_dir);
+    if (mp4_files.size() < kMinConcatFiles) {
+        BOOST_LOG_TRIVIAL(info) << std::format(
+            "Found {} MP4 file(s). Need at least {} files to concatenate.",
+            mp4_files.size(), kMinConcatFiles);
         return 1;
     }
 
-    BOOST_LOG_TRIVIAL(info) << "Found " << mp4_files.size() << " MP4 files to concatenate:";
-    for (const auto& f : mp4_files) {
-        BOOST_LOG_TRIVIAL(info) << "  - " << f.filename().string();
+    fs::create_directories(output_dir);
+
+    BOOST_LOG_TRIVIAL(info) << std::format("Found {} MP4 files to concatenate:", mp4_files.size());
+    for (const auto& file : mp4_files) {
+        BOOST_LOG_TRIVIAL(info) << std::format("  - {}", file.filename().string());
     }
 
-    fs::path output_file = output_dir / ("concatenated_" + media::current_timestamp() + ".mp4");
+    const std::string timestamp = media::current_timestamp();
+    fs::path output_file = output_dir / std::format("concatenated_{}.mp4", timestamp);
+    for (std::size_t suffix = 1; fs::exists(output_file); ++suffix) {
+        output_file = output_dir / std::format("concatenated_{}_{}.mp4", timestamp, suffix);
+    }
 
     Ffmpeg runner;
-    double total_duration = 0;
-    for (const auto& f : mp4_files) {
-        double d = runner.duration(f);
-        if (d > 0) total_duration += d;
-    }
+    const double total_duration = std::transform_reduce(
+        mp4_files.begin(), mp4_files.end(), 0.0, std::plus<>{},
+        [&runner](const fs::path& file) {
+            const double d = runner.duration(file);
+            return d > 0.0 ? d : 0.0;
+        });
 
     BOOST_LOG_TRIVIAL(info) << "Concatenating to: " << output_file;
 
-    IndicatorsProgressReporter rep;
-    bool ok = runner.concat(mp4_files, output_file, total_duration, rep);
+    auto remove_partial_output = core::make_scope_guard([&output_file]() noexcept {
+        std::error_code ec;
+        fs::remove(output_file, ec);
+    });
 
-    if (ok) {
-        media::log_output_size(output_file);
+    IndicatorsProgressReporter rep;
+    const bool ok = runner.concat(mp4_files, output_file, total_duration, rep);
+    if (!ok) {
+        return 1;
     }
 
-    return ok ? 0 : 1;
+    remove_partial_output.dismiss();
+    media::log_output_size(output_file);
+    return 0;
 }
 
 #ifndef TESTING_NO_MAIN

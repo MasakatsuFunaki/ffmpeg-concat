@@ -1,899 +1,593 @@
-#include <gtest/gtest.h>
 #include "extract/extract.h"
 
-#include <chrono>
-#include <filesystem>
-#include <thread>
+#include "av/media_probe.h"
+#include "support/cli_runner.hpp"
+#include "support/media_assertions.hpp"
+#include "support/test_sandbox.hpp"
+
+#include <gtest/gtest.h>
+#include <opencv2/core.hpp>
 #include <opencv2/imgcodecs.hpp>
+
+#include <algorithm>
+#include <array>
+#include <chrono>
+#include <cstddef>
+#include <filesystem>
+#include <format>
+#include <optional>
+#include <ranges>
+#include <span>
+#include <string>
+#include <string_view>
+#include <utility>
+#include <vector>
+
+namespace {
 
 namespace fs = std::filesystem;
 
-static const fs::path DATA_DIR      = TEST_DATA_DIR;
-static const fs::path OUTPUT_DIR    = TEST_OUTPUT_DIR;
-static const fs::path TEST_VIDEO    = DATA_DIR / "2026-03-22 00-16-33.mp4";
+constexpr int kMosaicWidth = 1920;
+constexpr int kMosaicHeight = 1080;
+constexpr std::size_t kBgrChannelCount = 3;
+constexpr std::size_t kMinStrikingFrames = 1;
+constexpr std::size_t kMaxStrikingFrames = 100;
+constexpr std::size_t kMinLifecycleStrikingFrames = 3;
+constexpr std::size_t kDetectHashFileCount = 1;
+constexpr std::size_t kSha256HexLength = 64;
+constexpr std::size_t kMinJpegBytes = 4;
+constexpr unsigned kJpegSoiFirst = 0xFFu;
+constexpr unsigned kJpegSoiSecond = 0xD8u;
+constexpr double kMinImageStdDev = 1.0;
+constexpr auto kPinnedMtimeAge = std::chrono::seconds{120};
+constexpr std::size_t kMultiVideoInputCount = 2;
+constexpr std::size_t kMultiVideoImageCount = 4;
+constexpr std::size_t kCombinedImageCount = 3;
+constexpr std::size_t kSameDirImageCount = 3;
+constexpr std::size_t kSameDirExpectedEntries = 2;
+constexpr std::size_t kExpectedSingleSubdir = 1;
+constexpr std::size_t kExpectedMosaicEntries = 2;
+constexpr std::size_t kExpectedCombinedSubdirs = 3;
+constexpr std::size_t kMaxInvalidCliExtraArgs = 4;
 
-// Helper to call ExtractApp::run with a vector of string args
-static int run_extract(std::vector<std::string> args) {
-    std::vector<char*> argv;
-    for (auto& a : args) argv.push_back(a.data());
-    ExtractApp app;
-    return app.run(static_cast<int>(argv.size()), argv.data());
+struct PinnedFile {
+    fs::path path;
+    fs::file_time_type pinned_mtime;
+    test_support::FileSnapshot snapshot;
+};
+
+struct InvalidCliCase {
+    std::string_view label;
+    bool use_missing_input = false;
+    std::array<std::string_view, kMaxInvalidCliExtraArgs> extra_args{};
+};
+
+[[nodiscard]] constexpr bool is_hex_char(char c) noexcept {
+    return (c >= '0' && c <= '9') || (c >= 'a' && c <= 'f') || (c >= 'A' && c <= 'F');
 }
 
-// ---------- Help ----------
-
-TEST(ExtractAppTest, HelpReturns0) {
-    EXPECT_EQ(0, run_extract({"extract", "--help"}));
+[[nodiscard]] double max_channel_stddev(const cv::Mat& image) {
+    cv::Scalar mean{};
+    cv::Scalar stddev{};
+    cv::meanStdDev(image, mean, stddev);
+    const std::array<double, kBgrChannelCount> channels{stddev[0], stddev[1], stddev[2]};
+    return std::ranges::max(channels);
 }
 
-// ---------- No args shows help ----------
-
-TEST(ExtractAppTest, NoArgsShowsHelp) {
-    EXPECT_EQ(0, run_extract({"extract"}));
+[[nodiscard]] std::string read_trimmed_text(const fs::path& file) {
+    std::string text = test_support::read_file_text(file);
+    while (!text.empty() && (text.back() == '\n' || text.back() == '\r' || text.back() == ' ')) {
+        text.pop_back();
+    }
+    return text;
 }
 
-// ---------- Missing mode flags ----------
-
-TEST(ExtractAppTest, NoModeFlagsReturns1) {
-    int rc = run_extract({
-        "extract",
-        "-i", DATA_DIR.string(),
-        "-o", (OUTPUT_DIR / "test_extract_nomode").string()
-    });
-    EXPECT_EQ(1, rc);
+[[nodiscard]] std::string read_non_empty_cache_file(const fs::path& hash_file) {
+    EXPECT_TRUE(fs::is_regular_file(hash_file)) << "Missing cache file: " << hash_file;
+    if (!fs::is_regular_file(hash_file)) {
+        return {};
+    }
+    const std::string text = read_trimmed_text(hash_file);
+    EXPECT_FALSE(text.empty()) << "Empty cache file: " << hash_file;
+    return text;
 }
 
-// ---------- Extract text mode ----------
+[[nodiscard]] std::string read_verified_dir_fingerprint_file(
+    const fs::path& hash_file, std::size_t expected_entry_count) {
+    const std::string text = read_non_empty_cache_file(hash_file);
+    if (text.empty()) {
+        return {};
+    }
+    std::size_t line_count = 0;
+    std::size_t pos = 0;
+    while (pos <= text.size()) {
+        const auto nl = text.find('\n', pos);
+        const std::string_view raw_line =
+            (nl == std::string::npos) ? std::string_view(text).substr(pos)
+                                      : std::string_view(text).substr(pos, nl - pos);
+        const std::string_view line =
+            (!raw_line.empty() && raw_line.back() == '\r') ? raw_line.substr(0, raw_line.size() - 1)
+                                                           : raw_line;
+        if (!line.empty()) {
+            const auto colon = line.rfind(':');
+            EXPECT_NE(colon, std::string_view::npos)
+                << "Expected name:sha256 entry in " << hash_file << ": " << line;
+            if (colon != std::string_view::npos) {
+                const auto name = line.substr(0, colon);
+                const auto hex = line.substr(colon + 1);
+                EXPECT_FALSE(name.empty()) << "Empty filename in fingerprint line: " << line;
+                EXPECT_EQ(hex.size(), kSha256HexLength)
+                    << "Unexpected SHA-256 hex length in " << hash_file << ": " << line;
+                EXPECT_TRUE(std::ranges::all_of(hex, is_hex_char))
+                    << "Non-hex characters in " << hash_file << ": " << line;
+            }
+            ++line_count;
+        }
+        if (nl == std::string::npos) {
+            break;
+        }
+        pos = nl + 1;
+    }
+    EXPECT_EQ(line_count, expected_entry_count)
+        << "Fingerprint line count mismatch in: " << hash_file;
+    return text;
+}
 
-TEST(ExtractAppTest, ExtractTextMode) {
-    if (!fs::exists(TEST_VIDEO)) GTEST_SKIP() << "Test video not found";
+// Verifies raw JPEG SOI markers and independent OpenCV BGR decoding.
+[[nodiscard]] cv::Mat decode_verified_jpeg(
+    const fs::path& file, std::optional<cv::Size> expected_size = std::nullopt) {
+    EXPECT_TRUE(fs::is_regular_file(file)) << "Missing JPEG: " << file;
+    if (!fs::is_regular_file(file)) {
+        return {};
+    }
 
-    fs::path out = OUTPUT_DIR / "test_extract_text";
-    fs::remove_all(out);
+    const auto bytes = test_support::read_file_bytes(file);
+    EXPECT_GE(bytes.size(), kMinJpegBytes) << "Truncated JPEG: " << file;
+    if (bytes.size() < kMinJpegBytes) {
+        return {};
+    }
+    EXPECT_EQ(std::to_integer<unsigned>(bytes[0]), kJpegSoiFirst) << "Bad JPEG SOI[0]: " << file;
+    EXPECT_EQ(std::to_integer<unsigned>(bytes[1]), kJpegSoiSecond) << "Bad JPEG SOI[1]: " << file;
 
-    int rc = run_extract({
-        "extract",
-        "-i", DATA_DIR.string(),
-        "-o", out.string(),
-        "--extract-text"
-    });
+    cv::Mat image = cv::imread(file.string(), cv::IMREAD_COLOR);
+    EXPECT_FALSE(image.empty()) << "OpenCV failed to decode JPEG: " << file;
+    if (image.empty()) {
+        return {};
+    }
 
-    EXPECT_EQ(0, rc);
+    EXPECT_EQ(image.channels(), static_cast<int>(kBgrChannelCount))
+        << "Unexpected channel count: " << file;
+    EXPECT_GT(image.cols, 0) << "Invalid width: " << file;
+    EXPECT_GT(image.rows, 0) << "Invalid height: " << file;
+    if (expected_size) {
+        EXPECT_EQ(image.cols, expected_size->width) << "Width mismatch: " << file;
+        EXPECT_EQ(image.rows, expected_size->height) << "Height mismatch: " << file;
+    }
+    return image;
+}
 
-    // Check that text crops directory was created
-    std::string video_stem = TEST_VIDEO.stem().string();
-    fs::path text_dir = out / video_stem / "text";
-    EXPECT_TRUE(fs::exists(text_dir)) << "Expected text dir: " << text_dir;
+[[nodiscard]] cv::Mat decode_verified_mosaic(const fs::path& mosaic_file) {
+    cv::Mat mosaic = decode_verified_jpeg(mosaic_file, cv::Size{kMosaicWidth, kMosaicHeight});
+    if (mosaic.empty()) {
+        return {};
+    }
+    EXPECT_GT(max_channel_stddev(mosaic), kMinImageStdDev)
+        << "Mosaic appears visually uniform: " << mosaic_file;
+    return mosaic;
+}
 
-    // Text crops should be JPG files (may be 0 if test video has no text)
-    int jpg_count = 0;
-    if (fs::exists(text_dir)) {
-        for (const auto& entry : fs::directory_iterator(text_dir)) {
-            if (entry.path().extension() == ".jpg") jpg_count++;
+[[nodiscard]] std::vector<cv::Mat> verify_equally_spaced_frames(
+    const fs::path& image_dir, std::size_t expected_count, cv::Size expected_size) {
+    EXPECT_TRUE(fs::is_directory(image_dir)) << "Expected image dir: " << image_dir;
+    const auto entries = test_support::list_all_entries(image_dir);
+    EXPECT_EQ(entries.size(), expected_count) << "Unexpected entry count in: " << image_dir;
+
+    std::vector<cv::Mat> decoded;
+    decoded.reserve(expected_count);
+    for (const auto index : std::views::iota(std::size_t{1}, expected_count + 1)) {
+        const fs::path frame_path = image_dir / std::format("frame_{:04d}.jpg", index);
+        decoded.push_back(decode_verified_jpeg(frame_path, expected_size));
+    }
+    return decoded;
+}
+
+[[nodiscard]] std::vector<fs::path> collect_verified_striking_frames(
+    const fs::path& detect_dir, cv::Size expected_size) {
+    EXPECT_TRUE(fs::is_directory(detect_dir)) << "Expected detect dir: " << detect_dir;
+    const auto striking_files = test_support::list_regular_files(detect_dir, ".jpg", "striking_");
+    EXPECT_GE(striking_files.size(), kMinStrikingFrames) << "Expected at least 1 striking frame";
+    EXPECT_LE(striking_files.size(), kMaxStrikingFrames)
+        << "Striking frame count exceeded documented limit";
+
+    const auto all_entries = test_support::list_all_entries(detect_dir);
+    EXPECT_EQ(all_entries.size(), striking_files.size() + kDetectHashFileCount)
+        << "Unexpected stray files or temp dirs in: " << detect_dir;
+
+    for (const auto& frame_path : striking_files) {
+        const cv::Mat frame = decode_verified_jpeg(frame_path, expected_size);
+        EXPECT_FALSE(frame.empty()) << "Failed decoding striking frame: " << frame_path;
+    }
+    return striking_files;
+}
+
+void verify_pinned_files_untouched(std::span<const PinnedFile> pinned, std::string_view phase) {
+    SCOPED_TRACE(std::string(phase));
+    for (const auto& item : pinned) {
+        EXPECT_TRUE(fs::is_regular_file(item.path)) << "Pinned file missing: " << item.path;
+        if (!fs::is_regular_file(item.path)) {
+            continue;
+        }
+        EXPECT_EQ(fs::last_write_time(item.path), item.pinned_mtime)
+            << "File rewritten despite expected cache hit: " << item.path;
+        EXPECT_TRUE(item.snapshot.is_unchanged())
+            << "File content changed despite expected cache hit: " << item.path;
+    }
+}
+
+[[nodiscard]] bool has_any_files_recursively(const fs::path& dir) {
+    if (!fs::exists(dir)) {
+        return false;
+    }
+    for (const auto& entry : fs::recursive_directory_iterator(dir)) {
+        if (entry.is_regular_file()) {
+            return true;
         }
     }
-    // We just verify the mode ran without crashing; count depends on video content
-    EXPECT_GE(jpg_count, 0);
-
-    fs::remove_all(out);
+    return false;
 }
 
-// ---------- Nonexistent input dir ----------
+}  // namespace
 
-TEST(ExtractAppTest, NonexistentInputPathReturns1) {
-    int rc = run_extract({
-        "extract",
-        "-i", (OUTPUT_DIR / "nonexistent_dir_99999").string(),
-        "-o", (OUTPUT_DIR / "test_extract_out").string(),
-        "--image", "5"
-    });
-    EXPECT_EQ(1, rc);
+TEST(ExtractAppTest, MultiVideoDirectoryEquallySpacedExtraction) {
+    const fs::path clip1_src = test_support::require_fixture(test_support::kFixtureUniformClip1);
+    const fs::path clip2_src = test_support::require_fixture(test_support::kFixtureUniformClip2);
+    ASSERT_TRUE(fs::is_regular_file(clip1_src));
+    ASSERT_TRUE(fs::is_regular_file(clip2_src));
+
+    const test_support::ScopedTempDir sandbox("extract_multi_video");
+    const fs::path in_dir = sandbox.create_subdir("input");
+    const fs::path out_dir = sandbox.child("output");
+
+    const fs::path clip1 = sandbox.copy_in(clip1_src, "input/scene alpha.mp4");
+    const fs::path clip2 = sandbox.copy_in(clip2_src, "input/scene_beta.mp4");
+    const fs::path ignored_txt = sandbox.write_text("input/notes.txt", "non-video metadata\n");
+
+    const av::MediaInfo info1 = av::probe(clip1);
+    const av::MediaInfo info2 = av::probe(clip2);
+    ASSERT_TRUE(info1.ok);
+    ASSERT_TRUE(info2.ok);
+    ASSERT_GT(info1.width, 0);
+    ASSERT_GT(info1.height, 0);
+    ASSERT_GT(info2.width, 0);
+    ASSERT_GT(info2.height, 0);
+
+    const test_support::FileSnapshot snap1(clip1);
+    const test_support::FileSnapshot snap2(clip2);
+    const test_support::FileSnapshot txt_snap(ignored_txt);
+
+    const std::string in_arg = in_dir.string();
+    const std::string out_arg = out_dir.string();
+    const int rc = test_support::run_tool_app<ExtractApp>(
+        {"extract", "-i", in_arg, "-o", out_arg, "--image", "4"});
+    ASSERT_EQ(rc, 0);
+
+    const auto out_entries = test_support::list_all_entries(out_dir);
+    EXPECT_EQ(out_entries.size(), kMultiVideoInputCount);
+    EXPECT_FALSE(fs::exists(out_dir / "notes"));
+
+    const fs::path stem1_dir = out_dir / clip1.stem();
+    const fs::path stem2_dir = out_dir / clip2.stem();
+    EXPECT_EQ(test_support::list_all_entries(stem1_dir).size(), kExpectedSingleSubdir);
+    EXPECT_EQ(test_support::list_all_entries(stem2_dir).size(), kExpectedSingleSubdir);
+
+    const auto frames1 = verify_equally_spaced_frames(
+        stem1_dir / "image", kMultiVideoImageCount, cv::Size{info1.width, info1.height});
+    const auto frames2 = verify_equally_spaced_frames(
+        stem2_dir / "image", kMultiVideoImageCount, cv::Size{info2.width, info2.height});
+    EXPECT_EQ(frames1.size(), kMultiVideoImageCount);
+    EXPECT_EQ(frames2.size(), kMultiVideoImageCount);
+
+    EXPECT_TRUE(snap1.is_unchanged());
+    EXPECT_TRUE(snap2.is_unchanged());
+    EXPECT_TRUE(txt_snap.is_unchanged());
 }
 
-// ---------- Invalid image count ----------
+TEST(ExtractAppTest, SingleFileCombinedImageDetectAndMosaic) {
+    const fs::path video = test_support::require_fixture(test_support::kFixtureMainVideo);
+    ASSERT_TRUE(fs::is_regular_file(video));
 
-TEST(ExtractAppTest, InvalidImageCountReturns1) {
-    int rc = run_extract({
-        "extract",
-        "-i", DATA_DIR.string(),
-        "-o", (OUTPUT_DIR / "test_extract_badcount").string(),
-        "--image", "0"
-    });
-    EXPECT_EQ(1, rc);
-}
+    const av::MediaInfo src_info = av::probe(video);
+    ASSERT_TRUE(src_info.ok);
+    ASSERT_EQ(src_info.width, kMosaicWidth);
+    ASSERT_EQ(src_info.height, kMosaicHeight);
+    const cv::Size src_size{src_info.width, src_info.height};
 
-// ---------- Equally-spaced extraction ----------
+    const test_support::FileSnapshot video_snap(video);
+    const test_support::ScopedTempDir sandbox("extract_combined");
+    const fs::path out_dir = sandbox.child("output");
 
-TEST(ExtractAppTest, EquallySpacedExtraction) {
-    if (!fs::exists(TEST_VIDEO)) GTEST_SKIP() << "Test video not found";
+    const std::string in_arg = video.string();
+    const std::string out_arg = out_dir.string();
+    const int rc = test_support::run_tool_app<ExtractApp>(
+        {"extract", "-i", in_arg, "-o", out_arg, "--image", "3", "--image-detect", "--mosaic",
+         "3"});
+    ASSERT_EQ(rc, 0);
 
-    fs::path out = OUTPUT_DIR / "test_extract_image";
-    fs::remove_all(out);
+    const fs::path stem_dir = out_dir / video.stem();
+    EXPECT_EQ(test_support::list_all_entries(stem_dir).size(), kExpectedCombinedSubdirs);
 
-    int rc = run_extract({
-        "extract",
-        "-i", DATA_DIR.string(),
-        "-o", out.string(),
-        "--image", "4"
-    });
+    const auto image_frames =
+        verify_equally_spaced_frames(stem_dir / "image", kCombinedImageCount, src_size);
+    ASSERT_EQ(image_frames.size(), kCombinedImageCount);
+    ASSERT_FALSE(image_frames.front().empty());
+    ASSERT_FALSE(image_frames.back().empty());
+    EXPECT_GT(cv::norm(image_frames.front(), image_frames.back(), cv::NORM_L2), 0.0);
 
-    EXPECT_EQ(0, rc);
+    const fs::path detect_dir = stem_dir / "detect";
+    const auto striking_files = collect_verified_striking_frames(detect_dir, src_size);
+    EXPECT_FALSE(striking_files.empty());
+    const std::string detect_hash =
+        read_verified_dir_fingerprint_file(detect_dir / ".detect_hash", striking_files.size());
+    EXPECT_FALSE(detect_hash.empty());
 
-    // Check that frames were created in a subdirectory named after the video stem
-    std::string video_stem = TEST_VIDEO.stem().string();
-    fs::path image_dir = out / video_stem / "image";
-    EXPECT_TRUE(fs::exists(image_dir)) << "Expected image dir: " << image_dir;
-
-    int jpg_count = 0;
-    if (fs::exists(image_dir)) {
-        for (const auto& entry : fs::directory_iterator(image_dir)) {
-            if (entry.path().extension() == ".jpg") jpg_count++;
-        }
-    }
-    EXPECT_EQ(4, jpg_count) << "Expected 4 extracted frames";
-
-    fs::remove_all(out);
-}
-
-// ---------- Single-file input ----------
-
-TEST(ExtractAppTest, SingleFileInput) {
-    if (!fs::exists(TEST_VIDEO)) GTEST_SKIP() << "Test video not found";
-
-    fs::path out = OUTPUT_DIR / "test_extract_singlefile";
-    fs::remove_all(out);
-
-    int rc = run_extract({
-        "extract",
-        "-i", TEST_VIDEO.string(),
-        "-o", out.string(),
-        "--image", "3"
-    });
-
-    EXPECT_EQ(0, rc);
-
-    std::string video_stem = TEST_VIDEO.stem().string();
-    fs::path image_dir = out / video_stem / "image";
-    EXPECT_TRUE(fs::exists(image_dir)) << "Expected image dir: " << image_dir;
-
-    int jpg_count = 0;
-    if (fs::exists(image_dir)) {
-        for (const auto& entry : fs::directory_iterator(image_dir)) {
-            if (entry.path().extension() == ".jpg") jpg_count++;
-        }
-    }
-    EXPECT_EQ(3, jpg_count) << "Expected 3 extracted frames";
-
-    fs::remove_all(out);
-}
-
-// ---------- Striking-frame detection ----------
-
-TEST(ExtractAppTest, StrikingFrameDetection) {
-    if (!fs::exists(TEST_VIDEO)) GTEST_SKIP() << "Test video not found";
-
-    fs::path out = OUTPUT_DIR / "test_extract_detect";
-    fs::remove_all(out);
-
-    int rc = run_extract({
-        "extract",
-        "-i", DATA_DIR.string(),
-        "-o", out.string(),
-        "--image-detect"
-    });
-
-    EXPECT_EQ(0, rc);
-
-    // Check that striking frames were created
-    std::string video_stem = TEST_VIDEO.stem().string();
-    fs::path detect_dir = out / video_stem / "detect";
-    EXPECT_TRUE(fs::exists(detect_dir)) << "Expected detect dir: " << detect_dir;
-
-    int jpg_count = 0;
-    if (fs::exists(detect_dir)) {
-        for (const auto& entry : fs::directory_iterator(detect_dir)) {
-            if (entry.path().extension() == ".jpg") jpg_count++;
-        }
-    }
-    EXPECT_GT(jpg_count, 0) << "Expected at least 1 striking frame";
-    EXPECT_LE(jpg_count, 100) << "Should not exceed 100 striking frames";
-
-    fs::remove_all(out);
-}
-
-// ---------- Both modes simultaneously ----------
-
-TEST(ExtractAppTest, BothModesSimultaneously) {
-    if (!fs::exists(TEST_VIDEO)) GTEST_SKIP() << "Test video not found";
-
-    fs::path out = OUTPUT_DIR / "test_extract_both";
-    fs::remove_all(out);
-
-    int rc = run_extract({
-        "extract",
-        "-i", DATA_DIR.string(),
-        "-o", out.string(),
-        "--image", "3",
-        "--image-detect"
-    });
-
-    EXPECT_EQ(0, rc);
-
-    std::string video_stem = TEST_VIDEO.stem().string();
-    fs::path image_dir  = out / video_stem / "image";
-    fs::path detect_dir = out / video_stem / "detect";
-
-    EXPECT_TRUE(fs::exists(image_dir))  << "Expected image dir";
-    EXPECT_TRUE(fs::exists(detect_dir)) << "Expected detect dir";
-
-    fs::remove_all(out);
-}
-
-// ---------- All three modes simultaneously ----------
-
-TEST(ExtractAppTest, AllThreeModesSimultaneously) {
-    if (!fs::exists(TEST_VIDEO)) GTEST_SKIP() << "Test video not found";
-
-    fs::path out = OUTPUT_DIR / "test_extract_all3";
-    fs::remove_all(out);
-
-    int rc = run_extract({
-        "extract",
-        "-i", DATA_DIR.string(),
-        "-o", out.string(),
-        "--image", "3",
-        "--image-detect",
-        "--extract-text"
-    });
-
-    EXPECT_EQ(0, rc);
-
-    std::string video_stem = TEST_VIDEO.stem().string();
-    fs::path image_dir  = out / video_stem / "image";
-    fs::path detect_dir = out / video_stem / "detect";
-    fs::path text_dir   = out / video_stem / "text";
-
-    EXPECT_TRUE(fs::exists(image_dir))  << "Expected image dir";
-    EXPECT_TRUE(fs::exists(detect_dir)) << "Expected detect dir";
-    EXPECT_TRUE(fs::exists(text_dir))   << "Expected text dir";
-
-    fs::remove_all(out);
-}
-
-// ---------- Same input and output directory ----------
-// Output dir is no longer wiped, so using the same directory should work.
-
-TEST(ExtractAppTest, SameInputOutputDir) {
-    if (!fs::exists(TEST_VIDEO)) GTEST_SKIP() << "Test video not found";
-
-    // Prepare a temp directory used as BOTH input and output
-    fs::path same_dir = OUTPUT_DIR / "test_extract_same_dir";
-    fs::remove_all(same_dir);
-    fs::create_directories(same_dir);
-
-    fs::copy_file(TEST_VIDEO, same_dir / "2026-03-22 00-16-33.mp4", fs::copy_options::overwrite_existing);
-
-    int rc = run_extract({
-        "extract",
-        "-i", same_dir.string(),
-        "-o", same_dir.string(),
-        "--image", "3"
-    });
-
-    EXPECT_EQ(0, rc);
-
-    // Original video should still be intact
-    EXPECT_TRUE(fs::exists(same_dir / "2026-03-22 00-16-33.mp4"));
-
-    // Extracted frames should exist in a subdirectory
-    std::string video_stem = TEST_VIDEO.stem().string();
-    fs::path image_dir = same_dir / video_stem / "image";
-    EXPECT_TRUE(fs::exists(image_dir)) << "Expected image dir: " << image_dir;
-
-    fs::remove_all(same_dir);
-}
-
-// ---------- Mosaic requires --image-detect ----------
-
-TEST(ExtractAppTest, MosaicWithoutDetectReturns1) {
-    int rc = run_extract({
-        "extract",
-        "-i", DATA_DIR.string(),
-        "-o", (OUTPUT_DIR / "test_mosaic_nodetect").string(),
-        "--image", "3",
-        "--mosaic", "2"
-    });
-    EXPECT_EQ(1, rc);
-}
-
-// ---------- Mosaic invalid count ----------
-
-TEST(ExtractAppTest, MosaicInvalidCountReturns1) {
-    int rc = run_extract({
-        "extract",
-        "-i", DATA_DIR.string(),
-        "-o", (OUTPUT_DIR / "test_mosaic_badcount").string(),
-        "--image-detect",
-        "--mosaic", "0"
-    });
-    EXPECT_EQ(1, rc);
-}
-
-// ---------- Mosaic with N=2 ----------
-
-TEST(ExtractAppTest, MosaicWithN2) {
-    if (!fs::exists(TEST_VIDEO)) GTEST_SKIP() << "Test video not found";
-
-    fs::path out = OUTPUT_DIR / "test_mosaic_n2";
-    fs::remove_all(out);
-
-    int rc = run_extract({
-        "extract",
-        "-i", DATA_DIR.string(),
-        "-o", out.string(),
-        "--image-detect",
-        "--mosaic", "2"
-    });
-
-    EXPECT_EQ(0, rc);
-
-    std::string video_stem = TEST_VIDEO.stem().string();
-    fs::path detect_dir = out / video_stem / "detect";
-    fs::path mosaic_dir = out / video_stem / "mosaics";
-
-    EXPECT_TRUE(fs::exists(detect_dir)) << "Expected detect dir: " << detect_dir;
-    EXPECT_TRUE(fs::exists(mosaic_dir)) << "Expected mosaics dir: " << mosaic_dir;
-
-    fs::path mosaic_file = mosaic_dir / "mosaic.jpg";
-    EXPECT_TRUE(fs::exists(mosaic_file)) << "Expected mosaic.jpg in mosaics dir";
-
-    // Verify mosaic is a valid image with expected HD dimensions
-    cv::Mat mosaic = cv::imread(mosaic_file.string());
+    const fs::path mosaics_dir = stem_dir / "mosaics";
+    EXPECT_EQ(test_support::list_all_entries(mosaics_dir).size(), kExpectedMosaicEntries);
+    const cv::Mat mosaic = decode_verified_mosaic(mosaics_dir / "mosaic.jpg");
     EXPECT_FALSE(mosaic.empty());
-    EXPECT_EQ(1920, mosaic.cols);
-    EXPECT_EQ(1080, mosaic.rows);
+    const std::string mosaic_hash = read_non_empty_cache_file(mosaics_dir / ".mosaic_hash");
+    EXPECT_FALSE(mosaic_hash.empty());
 
-    fs::remove_all(out);
+    EXPECT_TRUE(video_snap.is_unchanged());
 }
 
-// ---------- Mosaic with N=3 ----------
+TEST(ExtractAppTest, DetectAndMosaicCacheHitAndInvalidationLifecycle) {
+    const fs::path video = test_support::require_fixture(test_support::kFixtureMainVideo);
+    ASSERT_TRUE(fs::is_regular_file(video));
 
-TEST(ExtractAppTest, MosaicWithN3) {
-    if (!fs::exists(TEST_VIDEO)) GTEST_SKIP() << "Test video not found";
+    const av::MediaInfo src_info = av::probe(video);
+    ASSERT_TRUE(src_info.ok);
+    ASSERT_EQ(src_info.width, kMosaicWidth);
+    ASSERT_EQ(src_info.height, kMosaicHeight);
+    const cv::Size src_size{src_info.width, src_info.height};
 
-    fs::path out = OUTPUT_DIR / "test_mosaic_n3";
-    fs::remove_all(out);
+    const test_support::FileSnapshot video_snap(video);
+    const test_support::ScopedTempDir sandbox("extract_cache_lifecycle");
+    const fs::path out_dir = sandbox.child("output");
+    const std::string in_arg = video.string();
+    const std::string out_arg = out_dir.string();
 
-    int rc = run_extract({
-        "extract",
-        "-i", DATA_DIR.string(),
-        "-o", out.string(),
-        "--image-detect",
-        "--mosaic", "3"
-    });
+    const fs::path stem_dir = out_dir / video.stem();
+    const fs::path detect_dir = stem_dir / "detect";
+    const fs::path mosaics_dir = stem_dir / "mosaics";
+    const fs::path detect_hash_file = detect_dir / ".detect_hash";
+    const fs::path mosaic_file = mosaics_dir / "mosaic.jpg";
+    const fs::path mosaic_hash_file = mosaics_dir / ".mosaic_hash";
 
-    EXPECT_EQ(0, rc);
+    // Cold detect + mosaic(N=2, P=1).
+    ASSERT_EQ(test_support::run_tool_app<ExtractApp>(
+                  {"extract", "-i", in_arg, "-o", out_arg, "--image-detect", "--mosaic", "2"}),
+              0);
 
-    std::string video_stem = TEST_VIDEO.stem().string();
-    fs::path mosaic_dir = out / video_stem / "mosaics";
-    fs::path mosaic_file = mosaic_dir / "mosaic.jpg";
+    const auto initial_striking = collect_verified_striking_frames(detect_dir, src_size);
+    ASSERT_GE(initial_striking.size(), kMinLifecycleStrikingFrames);
+    const std::string detect_hash_1 =
+        read_verified_dir_fingerprint_file(detect_hash_file, initial_striking.size());
+    const std::string mosaic_hash_n2_p1 = read_non_empty_cache_file(mosaic_hash_file);
+    const cv::Mat mosaic_n2_p1 = decode_verified_mosaic(mosaic_file);
+    ASSERT_FALSE(mosaic_n2_p1.empty());
 
-    EXPECT_TRUE(fs::exists(mosaic_file)) << "Expected mosaic.jpg";
+    std::vector<PinnedFile> pinned_striking;
+    pinned_striking.reserve(initial_striking.size());
+    for (const auto& path : initial_striking) {
+        const auto mtime = test_support::pin_mtime_in_past(path, kPinnedMtimeAge);
+        pinned_striking.push_back(PinnedFile{path, mtime, test_support::FileSnapshot(path)});
+    }
+    const auto pinned_mosaic_mtime = test_support::pin_mtime_in_past(mosaic_file, kPinnedMtimeAge);
+    const auto mosaic_digest_1 = test_support::digest_file(mosaic_file);
 
-    cv::Mat mosaic = cv::imread(mosaic_file.string());
-    EXPECT_FALSE(mosaic.empty());
-    EXPECT_EQ(1920, mosaic.cols);
-    EXPECT_EQ(1080, mosaic.rows);
+    // Repeat identical invocation hits both detect and mosaic caches without rewrites.
+    ASSERT_EQ(test_support::run_tool_app<ExtractApp>(
+                  {"extract", "-i", in_arg, "-o", out_arg, "--image-detect", "--mosaic", "2"}),
+              0);
+    EXPECT_EQ(test_support::list_regular_files(detect_dir, ".jpg", "striking_"), initial_striking);
+    verify_pinned_files_untouched(pinned_striking, "full cache hit");
+    ASSERT_TRUE(fs::is_regular_file(mosaic_file));
+    EXPECT_EQ(fs::last_write_time(mosaic_file), pinned_mosaic_mtime);
+    EXPECT_EQ(test_support::digest_file(mosaic_file), mosaic_digest_1);
+    EXPECT_EQ(read_verified_dir_fingerprint_file(detect_hash_file, initial_striking.size()),
+              detect_hash_1);
+    EXPECT_EQ(read_non_empty_cache_file(mosaic_hash_file), mosaic_hash_n2_p1);
 
-    fs::remove_all(out);
+    // Deleting mosaic.jpg regenerates mosaic only while detect frames remain cached.
+    ASSERT_TRUE(fs::remove(mosaic_file));
+    ASSERT_EQ(test_support::run_tool_app<ExtractApp>(
+                  {"extract", "-i", in_arg, "-o", out_arg, "--image-detect", "--mosaic", "2"}),
+              0);
+    ASSERT_FALSE(decode_verified_mosaic(mosaic_file).empty());
+    verify_pinned_files_untouched(pinned_striking, "mosaic-only regeneration after deletion");
+
+    // Changing mosaic count (N=2 -> N=3) invalidates mosaic cache only.
+    const auto pinned_before_n3 = test_support::pin_mtime_in_past(mosaic_file, kPinnedMtimeAge);
+    ASSERT_EQ(test_support::run_tool_app<ExtractApp>(
+                  {"extract", "-i", in_arg, "-o", out_arg, "--image-detect", "--mosaic", "3"}),
+              0);
+    const std::string mosaic_hash_n3_p1 = read_non_empty_cache_file(mosaic_hash_file);
+    EXPECT_NE(mosaic_hash_n3_p1, mosaic_hash_n2_p1);
+    ASSERT_TRUE(fs::is_regular_file(mosaic_file));
+    EXPECT_NE(fs::last_write_time(mosaic_file), pinned_before_n3);
+    const cv::Mat mosaic_n3_p1 = decode_verified_mosaic(mosaic_file);
+    ASSERT_FALSE(mosaic_n3_p1.empty());
+    EXPECT_GT(cv::norm(mosaic_n2_p1, mosaic_n3_p1, cv::NORM_L2), 0.0);
+    verify_pinned_files_untouched(pinned_striking, "mosaic invalidation on count change");
+
+    // Changing start position (P=1 -> P=2) invalidates mosaic cache only.
+    const auto pinned_before_p2 = test_support::pin_mtime_in_past(mosaic_file, kPinnedMtimeAge);
+    ASSERT_EQ(test_support::run_tool_app<ExtractApp>(
+                  {"extract", "-i", in_arg, "-o", out_arg, "--image-detect", "--mosaic", "2", "2"}),
+              0);
+    const std::string mosaic_hash_n2_p2 = read_non_empty_cache_file(mosaic_hash_file);
+    EXPECT_NE(mosaic_hash_n2_p2, mosaic_hash_n3_p1);
+    EXPECT_NE(mosaic_hash_n2_p2, mosaic_hash_n2_p1);
+    ASSERT_TRUE(fs::is_regular_file(mosaic_file));
+    EXPECT_NE(fs::last_write_time(mosaic_file), pinned_before_p2);
+    const cv::Mat mosaic_n2_p2 = decode_verified_mosaic(mosaic_file);
+    ASSERT_FALSE(mosaic_n2_p2.empty());
+    EXPECT_GT(cv::norm(mosaic_n2_p1, mosaic_n2_p2, cv::NORM_L2), 0.0);
+    verify_pinned_files_untouched(pinned_striking, "mosaic invalidation on start position change");
+
+    // Deleting one striking frame invalidates detect cache and restores the full set.
+    const fs::path deleted_frame = pinned_striking.front().path;
+    const auto deleted_pinned_mtime = pinned_striking.front().pinned_mtime;
+    ASSERT_TRUE(fs::remove(deleted_frame));
+    ASSERT_EQ(test_support::run_tool_app<ExtractApp>(
+                  {"extract", "-i", in_arg, "-o", out_arg, "--image-detect"}),
+              0);
+
+    const auto restored_striking = test_support::list_regular_files(detect_dir, ".jpg", "striking_");
+    EXPECT_EQ(restored_striking.size(), initial_striking.size());
+    ASSERT_TRUE(fs::is_regular_file(deleted_frame));
+    EXPECT_NE(fs::last_write_time(deleted_frame), deleted_pinned_mtime);
+    EXPECT_FALSE(decode_verified_jpeg(deleted_frame, src_size).empty());
+    EXPECT_EQ(
+        test_support::list_all_entries(detect_dir).size(),
+        restored_striking.size() + kDetectHashFileCount);
+    const std::string detect_hash_2 =
+        read_verified_dir_fingerprint_file(detect_hash_file, restored_striking.size());
+    EXPECT_FALSE(detect_hash_2.empty());
+
+    EXPECT_TRUE(video_snap.is_unchanged());
 }
 
-// ---------- Mosaic with N=1 ----------
+TEST(ExtractAppTest, SameInputOutputDirPreservesSourceVideo) {
+    const fs::path clip_src = test_support::require_fixture(test_support::kFixtureUniformClip1);
+    ASSERT_TRUE(fs::is_regular_file(clip_src));
 
-TEST(ExtractAppTest, MosaicWithN1) {
-    if (!fs::exists(TEST_VIDEO)) GTEST_SKIP() << "Test video not found";
+    const test_support::ScopedTempDir sandbox("extract_same_dir");
+    const fs::path video_copy = sandbox.copy_in(clip_src, "same_dir_clip.mp4");
 
-    fs::path out = OUTPUT_DIR / "test_mosaic_n1";
-    fs::remove_all(out);
+    const av::MediaInfo src_info = av::probe(video_copy);
+    ASSERT_TRUE(src_info.ok);
+    ASSERT_GT(src_info.width, 0);
+    ASSERT_GT(src_info.height, 0);
 
-    int rc = run_extract({
-        "extract",
-        "-i", DATA_DIR.string(),
-        "-o", out.string(),
-        "--image-detect",
-        "--mosaic", "1"
-    });
+    const test_support::FileSnapshot snap(video_copy);
+    const std::string dir_arg = sandbox.path().string();
+    const int rc = test_support::run_tool_app<ExtractApp>(
+        {"extract", "-i", dir_arg, "-o", dir_arg, "--image", "3"});
+    ASSERT_EQ(rc, 0);
 
-    EXPECT_EQ(0, rc);
+    EXPECT_TRUE(snap.is_unchanged());
+    EXPECT_EQ(test_support::list_all_entries(sandbox.path()).size(), kSameDirExpectedEntries);
 
-    std::string video_stem = TEST_VIDEO.stem().string();
-    fs::path mosaic_file = out / video_stem / "mosaics" / "mosaic.jpg";
-    EXPECT_TRUE(fs::exists(mosaic_file)) << "Expected mosaic.jpg";
-
-    cv::Mat mosaic = cv::imread(mosaic_file.string());
-    EXPECT_FALSE(mosaic.empty());
-    EXPECT_EQ(1920, mosaic.cols);
-    EXPECT_EQ(1080, mosaic.rows);
-
-    fs::remove_all(out);
+    const fs::path stem_dir = sandbox.path() / video_copy.stem();
+    EXPECT_EQ(test_support::list_all_entries(stem_dir).size(), kExpectedSingleSubdir);
+    const auto frames = verify_equally_spaced_frames(
+        stem_dir / "image", kSameDirImageCount, cv::Size{src_info.width, src_info.height});
+    EXPECT_EQ(frames.size(), kSameDirImageCount);
 }
 
-// ---------- Mosaic with large N (more than striking frames) — should fail ----------
+TEST(ExtractAppTest, ExtractTextModeProducesOnlyValidCropsAndPreservesInput) {
+    const fs::path video = test_support::require_fixture(test_support::kFixtureMainVideo);
+    ASSERT_TRUE(fs::is_regular_file(video));
 
-TEST(ExtractAppTest, MosaicWithLargeN) {
-    if (!fs::exists(TEST_VIDEO)) GTEST_SKIP() << "Test video not found";
+    const av::MediaInfo src_info = av::probe(video);
+    ASSERT_TRUE(src_info.ok);
+    ASSERT_GT(src_info.width, 0);
+    ASSERT_GT(src_info.height, 0);
 
-    fs::path out = OUTPUT_DIR / "test_mosaic_large";
-    fs::remove_all(out);
+    const test_support::FileSnapshot video_snap(video);
+    const test_support::ScopedTempDir sandbox("extract_text");
+    const fs::path out_dir = sandbox.child("output");
 
-    int rc = run_extract({
-        "extract",
-        "-i", DATA_DIR.string(),
-        "-o", out.string(),
-        "--image-detect",
-        "--mosaic", "500"
-    });
+    const std::string in_arg = video.string();
+    const std::string out_arg = out_dir.string();
+    const int rc = test_support::run_tool_app<ExtractApp>(
+        {"extract", "-i", in_arg, "-o", out_arg, "--extract-text"});
+    ASSERT_EQ(rc, 0);
 
-    // Should fail: not enough striking frames for N=500
-    EXPECT_EQ(1, rc);
+    const fs::path stem_dir = out_dir / video.stem();
+    EXPECT_EQ(test_support::list_all_entries(stem_dir).size(), kExpectedSingleSubdir);
 
-    fs::remove_all(out);
+    const fs::path text_dir = stem_dir / "text";
+    ASSERT_TRUE(fs::is_directory(text_dir));
+
+    const auto all_entries = test_support::list_all_entries(text_dir);
+    const auto jpg_crops = test_support::list_regular_files(text_dir, ".jpg", "text_");
+    EXPECT_EQ(all_entries.size(), jpg_crops.size())
+        << "Stray non-crop files found in text output dir: " << text_dir;
+    ASSERT_GE(jpg_crops.size(), 1u)
+        << "Expected at least one detected text crop from real capture in: " << text_dir;
+
+    for (const auto& crop_path : jpg_crops) {
+        const cv::Mat crop = decode_verified_jpeg(crop_path);
+        ASSERT_FALSE(crop.empty()) << "Failed to decode text crop: " << crop_path;
+        EXPECT_LE(crop.cols, src_info.width);
+        EXPECT_LE(crop.rows, src_info.height);
+        EXPECT_GT(max_channel_stddev(crop), 0.0)
+            << "Text crop has zero pixel contrast: " << crop_path;
+    }
+
+    EXPECT_TRUE(video_snap.is_unchanged());
 }
 
-// ---------- Detect cache: second run skips extraction ----------
+TEST(ExtractAppTest, RejectsInvalidCliOptionsWithoutLeakingOutputs) {
+    const fs::path clip = test_support::require_fixture(test_support::kFixtureUniformClip1);
+    ASSERT_TRUE(fs::is_regular_file(clip));
 
-TEST(ExtractAppTest, DetectCacheSkipsReExtraction) {
-    if (!fs::exists(TEST_VIDEO)) GTEST_SKIP() << "Test video not found";
+    const test_support::FileSnapshot clip_snap(clip);
+    const test_support::ScopedTempDir sandbox("extract_invalid_cli");
+    const fs::path missing_path = sandbox.child("does_not_exist_input");
 
-    fs::path out = OUTPUT_DIR / "test_detect_cache";
-    fs::remove_all(out);
-
-    // First run — full extraction
-    int rc1 = run_extract({
-        "extract",
-        "-i", DATA_DIR.string(),
-        "-o", out.string(),
-        "--image-detect"
+    constexpr auto kInvalidCases = std::to_array<InvalidCliCase>({
+        {"missing_mode_flags", false, {}},
+        {"nonexistent_input", true, {{"--image", "2"}}},
+        {"zero_image_count", false, {{"--image", "0"}}},
+        {"mosaic_without_detect", false, {{"--image", "2", "--mosaic", "2"}}},
+        {"mosaic_zero_count", false, {{"--image-detect", "--mosaic", "0"}}},
+        {"mosaic_zero_start", false, {{"--image-detect", "--mosaic", "2", "0"}}},
+        {"mosaic_negative_start", false, {{"--image-detect", "--mosaic", "2", "-1"}}},
     });
-    EXPECT_EQ(0, rc1);
 
-    std::string video_stem = TEST_VIDEO.stem().string();
-    fs::path detect_dir = out / video_stem / "detect";
-    fs::path hash_file = detect_dir / ".detect_hash";
-
-    EXPECT_TRUE(fs::exists(hash_file)) << "Expected .detect_hash after first run";
-
-    // Count files and record modification times
-    int jpg_count_1 = 0;
-    fs::file_time_type oldest_mtime = fs::file_time_type::max();
-    for (const auto& entry : fs::directory_iterator(detect_dir)) {
-        if (entry.is_regular_file() && entry.path().extension() == ".jpg") {
-            jpg_count_1++;
-            auto t = entry.last_write_time();
-            if (t < oldest_mtime) oldest_mtime = t;
+    for (const auto& tc : kInvalidCases) {
+        SCOPED_TRACE(std::string(tc.label));
+        const fs::path case_out = sandbox.child(tc.label);
+        std::vector<std::string> args{
+            "extract",
+            "-i",
+            (tc.use_missing_input ? missing_path : clip).string(),
+            "-o",
+            case_out.string(),
+        };
+        for (const std::string_view arg : tc.extra_args) {
+            if (!arg.empty()) {
+                args.emplace_back(arg);
+            }
         }
-    }
-    EXPECT_GT(jpg_count_1, 0);
 
-    // Second run — should hit cache, files unchanged
-    int rc2 = run_extract({
-        "extract",
-        "-i", DATA_DIR.string(),
-        "-o", out.string(),
-        "--image-detect"
-    });
-    EXPECT_EQ(0, rc2);
-
-    // Files should still be the same (not re-created)
-    int jpg_count_2 = 0;
-    for (const auto& entry : fs::directory_iterator(detect_dir)) {
-        if (entry.is_regular_file() && entry.path().extension() == ".jpg") {
-            jpg_count_2++;
-            // Modification time should be unchanged (cache hit => no file writes)
-            EXPECT_EQ(oldest_mtime <= entry.last_write_time(), true);
-        }
-    }
-    EXPECT_EQ(jpg_count_1, jpg_count_2);
-
-    fs::remove_all(out);
-}
-
-// ---------- Detect cache invalidated when file deleted ----------
-
-TEST(ExtractAppTest, DetectCacheInvalidatedOnFileDeleted) {
-    if (!fs::exists(TEST_VIDEO)) GTEST_SKIP() << "Test video not found";
-
-    fs::path out = OUTPUT_DIR / "test_detect_cache_invalidate";
-    fs::remove_all(out);
-
-    // First run
-    int rc1 = run_extract({
-        "extract",
-        "-i", DATA_DIR.string(),
-        "-o", out.string(),
-        "--image-detect"
-    });
-    EXPECT_EQ(0, rc1);
-
-    std::string video_stem = TEST_VIDEO.stem().string();
-    fs::path detect_dir = out / video_stem / "detect";
-
-    // Delete one striking file to invalidate cache
-    for (const auto& entry : fs::directory_iterator(detect_dir)) {
-        if (entry.path().filename().string().find("striking_") == 0) {
-            fs::remove(entry.path());
-            break;  // delete just one
-        }
+        const int rc = test_support::run_tool_app<ExtractApp>(args);
+        EXPECT_EQ(rc, 1);
+        EXPECT_FALSE(has_any_files_recursively(case_out))
+            << "Invalid CLI case leaked output files into: " << case_out;
     }
 
-    // Second run — cache should miss, re-extract
-    int rc2 = run_extract({
-        "extract",
-        "-i", DATA_DIR.string(),
-        "-o", out.string(),
-        "--image-detect"
-    });
-    EXPECT_EQ(0, rc2);
-
-    // Should have re-extracted full set
-    int jpg_count = 0;
-    for (const auto& entry : fs::directory_iterator(detect_dir)) {
-        if (entry.is_regular_file() && entry.path().extension() == ".jpg") {
-            jpg_count++;
-        }
-    }
-    EXPECT_GT(jpg_count, 0);
-
-    fs::remove_all(out);
-}
-
-// ---------- Mosaic cache: second run skips regeneration ----------
-
-TEST(ExtractAppTest, MosaicCacheSkipsRegeneration) {
-    if (!fs::exists(TEST_VIDEO)) GTEST_SKIP() << "Test video not found";
-
-    fs::path out = OUTPUT_DIR / "test_mosaic_cache";
-    fs::remove_all(out);
-
-    // First run
-    int rc1 = run_extract({
-        "extract",
-        "-i", DATA_DIR.string(),
-        "-o", out.string(),
-        "--image-detect",
-        "--mosaic", "3"
-    });
-    EXPECT_EQ(0, rc1);
-
-    std::string video_stem = TEST_VIDEO.stem().string();
-    fs::path mosaic_dir = out / video_stem / "mosaics";
-    fs::path mosaic_file = mosaic_dir / "mosaic.jpg";
-    fs::path hash_file = mosaic_dir / ".mosaic_hash";
-
-    EXPECT_TRUE(fs::exists(mosaic_file));
-    EXPECT_TRUE(fs::exists(hash_file)) << "Expected .mosaic_hash after first run";
-
-    auto mtime1 = fs::last_write_time(mosaic_file);
-
-    // Second run — both detect and mosaic should hit cache
-    int rc2 = run_extract({
-        "extract",
-        "-i", DATA_DIR.string(),
-        "-o", out.string(),
-        "--image-detect",
-        "--mosaic", "3"
-    });
-    EXPECT_EQ(0, rc2);
-
-    // Mosaic file should not have been regenerated
-    auto mtime2 = fs::last_write_time(mosaic_file);
-    EXPECT_EQ(mtime1, mtime2) << "Mosaic should not be regenerated on cache hit";
-
-    fs::remove_all(out);
-}
-
-// ---------- Mosaic regenerated when deleted ----------
-
-TEST(ExtractAppTest, MosaicRegeneratedWhenDeleted) {
-    if (!fs::exists(TEST_VIDEO)) GTEST_SKIP() << "Test video not found";
-
-    fs::path out = OUTPUT_DIR / "test_mosaic_regen";
-    fs::remove_all(out);
-
-    // First run
-    int rc1 = run_extract({
-        "extract",
-        "-i", DATA_DIR.string(),
-        "-o", out.string(),
-        "--image-detect",
-        "--mosaic", "2"
-    });
-    EXPECT_EQ(0, rc1);
-
-    std::string video_stem = TEST_VIDEO.stem().string();
-    fs::path mosaic_file = out / video_stem / "mosaics" / "mosaic.jpg";
-    EXPECT_TRUE(fs::exists(mosaic_file));
-
-    // Delete the mosaic
-    fs::remove(mosaic_file);
-    EXPECT_FALSE(fs::exists(mosaic_file));
-
-    // Second run — detect should cache-hit, mosaic should regenerate
-    int rc2 = run_extract({
-        "extract",
-        "-i", DATA_DIR.string(),
-        "-o", out.string(),
-        "--image-detect",
-        "--mosaic", "2"
-    });
-    EXPECT_EQ(0, rc2);
-
-    EXPECT_TRUE(fs::exists(mosaic_file)) << "Mosaic should be regenerated after deletion";
-
-    fs::remove_all(out);
-}
-
-// ---------- Mosaic regenerated when count changes ----------
-
-TEST(ExtractAppTest, MosaicRegeneratedWhenCountChanges) {
-    if (!fs::exists(TEST_VIDEO)) GTEST_SKIP() << "Test video not found";
-
-    fs::path out = OUTPUT_DIR / "test_mosaic_count_change";
-    fs::remove_all(out);
-
-    // First run with N=2
-    int rc1 = run_extract({
-        "extract",
-        "-i", DATA_DIR.string(),
-        "-o", out.string(),
-        "--image-detect",
-        "--mosaic", "2"
-    });
-    EXPECT_EQ(0, rc1);
-
-    std::string video_stem = TEST_VIDEO.stem().string();
-    fs::path mosaic_file = out / video_stem / "mosaics" / "mosaic.jpg";
-    EXPECT_TRUE(fs::exists(mosaic_file));
-
-    auto mtime1 = fs::last_write_time(mosaic_file);
-
-    // Second run with N=4 — mosaic_count changed, should regenerate
-    std::this_thread::sleep_for(std::chrono::milliseconds(20));
-    int rc2 = run_extract({
-        "extract",
-        "-i", DATA_DIR.string(),
-        "-o", out.string(),
-        "--image-detect",
-        "--mosaic", "4"
-    });
-    EXPECT_EQ(0, rc2);
-
-    EXPECT_TRUE(fs::exists(mosaic_file));
-    auto mtime2 = fs::last_write_time(mosaic_file);
-    EXPECT_NE(mtime1, mtime2) << "Mosaic should be regenerated when count changes";
-
-    fs::remove_all(out);
-}
-
-// ---------- Mosaic with start position P ----------
-
-TEST(ExtractAppTest, MosaicWithStartPosition) {
-    if (!fs::exists(TEST_VIDEO)) GTEST_SKIP() << "Test video not found";
-
-    fs::path out = OUTPUT_DIR / "test_mosaic_start_pos";
-    fs::remove_all(out);
-
-    // First: run detect only to count striking frames
-    int rc_detect = run_extract({
-        "extract",
-        "-i", DATA_DIR.string(),
-        "-o", out.string(),
-        "--image-detect"
-    });
-    EXPECT_EQ(0, rc_detect);
-
-    std::string video_stem = TEST_VIDEO.stem().string();
-    fs::path detect_dir = out / video_stem / "detect";
-
-    // Count striking frames
-    int total_striking = 0;
-    for (const auto& entry : fs::directory_iterator(detect_dir)) {
-        if (entry.is_regular_file() &&
-            entry.path().extension() == ".jpg" &&
-            entry.path().filename().string().find("striking_") == 0) {
-            total_striking++;
-        }
-    }
-    ASSERT_GE(total_striking, 3) << "Need at least 3 striking frames for this test";
-
-    // Run mosaic with start position 2: --mosaic 2 2
-    int rc = run_extract({
-        "extract",
-        "-i", DATA_DIR.string(),
-        "-o", out.string(),
-        "--image-detect",
-        "--mosaic", "2", "2"
-    });
-    EXPECT_EQ(0, rc);
-
-    fs::path mosaic_file = out / video_stem / "mosaics" / "mosaic.jpg";
-    EXPECT_TRUE(fs::exists(mosaic_file)) << "Expected mosaic.jpg with start position P=2";
-
-    cv::Mat mosaic = cv::imread(mosaic_file.string());
-    EXPECT_FALSE(mosaic.empty());
-    EXPECT_EQ(1920, mosaic.cols);
-    EXPECT_EQ(1080, mosaic.rows);
-
-    fs::remove_all(out);
-}
-
-// ---------- Mosaic start position P out of range ----------
-
-TEST(ExtractAppTest, MosaicStartPositionOutOfRange) {
-    if (!fs::exists(TEST_VIDEO)) GTEST_SKIP() << "Test video not found";
-
-    fs::path out = OUTPUT_DIR / "test_mosaic_start_oor";
-    fs::remove_all(out);
-
-    // P=9999 is certainly out of range
-    int rc = run_extract({
-        "extract",
-        "-i", DATA_DIR.string(),
-        "-o", out.string(),
-        "--image-detect",
-        "--mosaic", "2", "9999"
-    });
-
-    EXPECT_EQ(1, rc);
-
-    fs::remove_all(out);
-}
-
-// ---------- Mosaic not enough frames from position P ----------
-
-TEST(ExtractAppTest, MosaicNotEnoughFramesFromPositionP) {
-    if (!fs::exists(TEST_VIDEO)) GTEST_SKIP() << "Test video not found";
-
-    fs::path out = OUTPUT_DIR / "test_mosaic_not_enough";
-    fs::remove_all(out);
-
-    // First: detect frames to know total
-    int rc_detect = run_extract({
-        "extract",
-        "-i", DATA_DIR.string(),
-        "-o", out.string(),
-        "--image-detect"
-    });
-    EXPECT_EQ(0, rc_detect);
-
-    std::string video_stem = TEST_VIDEO.stem().string();
-    fs::path detect_dir = out / video_stem / "detect";
-
-    int total_striking = 0;
-    for (const auto& entry : fs::directory_iterator(detect_dir)) {
-        if (entry.is_regular_file() &&
-            entry.path().extension() == ".jpg" &&
-            entry.path().filename().string().find("striking_") == 0) {
-            total_striking++;
-        }
-    }
-    ASSERT_GT(total_striking, 0) << "Need at least 1 striking frame";
-
-    // Request more images than available from the last position
-    // e.g., start at last frame, request 2 → only 1 available
-    int rc = run_extract({
-        "extract",
-        "-i", DATA_DIR.string(),
-        "-o", out.string(),
-        "--image-detect",
-        "--mosaic", std::to_string(total_striking), std::to_string(total_striking)
-    });
-
-    // Only 1 frame available from position=total, but requesting total → fail
-    if (total_striking > 1) {
-        EXPECT_EQ(1, rc);
-    } else {
-        // If total_striking == 1: from position 1, requesting 1 → should succeed
-        EXPECT_EQ(0, rc);
-    }
-
-    fs::remove_all(out);
-}
-
-// ---------- Mosaic invalid start position P=0 ----------
-
-TEST(ExtractAppTest, MosaicInvalidStartPositionZero) {
-    int rc = run_extract({
-        "extract",
-        "-i", DATA_DIR.string(),
-        "-o", (OUTPUT_DIR / "test_mosaic_p0").string(),
-        "--image-detect",
-        "--mosaic", "2", "0"
-    });
-    EXPECT_EQ(1, rc);
-}
-
-// ---------- Mosaic invalid start position P negative ----------
-
-TEST(ExtractAppTest, MosaicInvalidStartPositionNegative) {
-    int rc = run_extract({
-        "extract",
-        "-i", DATA_DIR.string(),
-        "-o", (OUTPUT_DIR / "test_mosaic_pneg").string(),
-        "--image-detect",
-        "--mosaic", "2", "-1"
-    });
-    EXPECT_EQ(1, rc);
-}
-
-// ---------- Mosaic cache invalidated when start position changes ----------
-
-TEST(ExtractAppTest, MosaicRegeneratedWhenStartPositionChanges) {
-    if (!fs::exists(TEST_VIDEO)) GTEST_SKIP() << "Test video not found";
-
-    fs::path out = OUTPUT_DIR / "test_mosaic_start_change";
-    fs::remove_all(out);
-
-    // First run with P=1 (default)
-    int rc1 = run_extract({
-        "extract",
-        "-i", DATA_DIR.string(),
-        "-o", out.string(),
-        "--image-detect",
-        "--mosaic", "2"
-    });
-    EXPECT_EQ(0, rc1);
-
-    std::string video_stem = TEST_VIDEO.stem().string();
-    fs::path mosaic_file = out / video_stem / "mosaics" / "mosaic.jpg";
-    EXPECT_TRUE(fs::exists(mosaic_file));
-
-    auto mtime1 = fs::last_write_time(mosaic_file);
-
-    // Second run with P=2 — start changed, should regenerate
-    std::this_thread::sleep_for(std::chrono::milliseconds(20));
-    int rc2 = run_extract({
-        "extract",
-        "-i", DATA_DIR.string(),
-        "-o", out.string(),
-        "--image-detect",
-        "--mosaic", "2", "2"
-    });
-    EXPECT_EQ(0, rc2);
-
-    EXPECT_TRUE(fs::exists(mosaic_file));
-    auto mtime2 = fs::last_write_time(mosaic_file);
-    EXPECT_NE(mtime1, mtime2) << "Mosaic should be regenerated when start position changes";
-
-    fs::remove_all(out);
-}
-
-// ---------- Mosaic with start position P=1 is same as default ----------
-
-TEST(ExtractAppTest, MosaicStartPositionOneIsDefault) {
-    if (!fs::exists(TEST_VIDEO)) GTEST_SKIP() << "Test video not found";
-
-    fs::path out = OUTPUT_DIR / "test_mosaic_p1_default";
-    fs::remove_all(out);
-
-    // Run with explicit P=1
-    int rc = run_extract({
-        "extract",
-        "-i", DATA_DIR.string(),
-        "-o", out.string(),
-        "--image-detect",
-        "--mosaic", "2", "1"
-    });
-    EXPECT_EQ(0, rc);
-
-    std::string video_stem = TEST_VIDEO.stem().string();
-    fs::path mosaic_file = out / video_stem / "mosaics" / "mosaic.jpg";
-    EXPECT_TRUE(fs::exists(mosaic_file));
-
-    cv::Mat mosaic = cv::imread(mosaic_file.string());
-    EXPECT_FALSE(mosaic.empty());
-    EXPECT_EQ(1920, mosaic.cols);
-    EXPECT_EQ(1080, mosaic.rows);
-
-    fs::remove_all(out);
+    const fs::path overflow_out = sandbox.child("mosaic_overflow");
+    const std::string clip_arg = clip.string();
+    const std::string overflow_arg = overflow_out.string();
+    const fs::path mosaics_dir = overflow_out / clip.stem() / "mosaics";
+
+    EXPECT_EQ(test_support::run_tool_app<ExtractApp>(
+                  {"extract", "-i", clip_arg, "-o", overflow_arg, "--image-detect", "--mosaic",
+                   "500"}),
+              1);
+    EXPECT_FALSE(fs::exists(mosaics_dir / "mosaic.jpg"));
+    EXPECT_FALSE(fs::exists(mosaics_dir / ".mosaic_hash"));
+
+    EXPECT_EQ(test_support::run_tool_app<ExtractApp>(
+                  {"extract", "-i", clip_arg, "-o", overflow_arg, "--image-detect", "--mosaic",
+                   "2", "9999"}),
+              1);
+    EXPECT_FALSE(fs::exists(mosaics_dir / "mosaic.jpg"));
+    EXPECT_FALSE(fs::exists(mosaics_dir / ".mosaic_hash"));
+
+    EXPECT_TRUE(clip_snap.is_unchanged());
 }

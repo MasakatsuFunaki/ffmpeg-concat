@@ -1,19 +1,17 @@
 #pragma once
 
-// ---------------------------------------------------------------------------
-// ProgressParser::Snapshot – one sampled view of a run's progress.
-//
-// The name is historical: this used to parse ffmpeg's `-progress pipe:1` output
-// line by line. Now that the pipeline runs in-process the numbers are measured
-// directly, and only the value type the reporters render survived.
-// ---------------------------------------------------------------------------
+// ProgressParser::Snapshot holds one sampled view of an in-process run's progress.
 
 #include <string>
 
 class ProgressParser {
 public:
     struct Snapshot {
-        double current_sec;             // output position reached so far
-        std::string out_time, fps, speed;   // preformatted for display
+        double current_sec = 0.0;
+        std::string out_time;
+        std::string fps;
+        std::string speed;
+
+        [[nodiscard]] bool operator==(const Snapshot&) const = default;
     };
 };

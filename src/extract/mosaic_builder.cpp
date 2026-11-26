@@ -4,7 +4,13 @@
 
 #include <algorithm>
 #include <cmath>
+#include <cstddef>
+#include <format>
+#include <ranges>
+#include <span>
 #include <string>
+#include <string_view>
+#include <utility>
 #include <vector>
 
 #include <boost/log/trivial.hpp>
@@ -13,78 +19,95 @@
 #include <opencv2/imgcodecs.hpp>
 #include <opencv2/imgproc.hpp>
 
+namespace {
+
+constexpr int kMinMosaicCount = 1;
+constexpr int kMinMosaicStart = 1;
+constexpr int kCanvasWidth = 1920;
+constexpr int kCanvasHeight = 1080;
+constexpr std::string_view kStrikingPrefix = "striking_";
+constexpr std::string_view kJpgExtension = ".jpg";
+
+}  // namespace
+
 bool MosaicBuilder::build(const fs::path& detect_dir,
                           const fs::path& mosaic_dir,
                           int mosaic_count,
                           int mosaic_start) const {
-    fs::path mosaic_file = mosaic_dir / "mosaic.jpg";
-    fs::path hash_file = mosaic_dir / ".mosaic_hash";
+    std::error_code ec;
+    if (mosaic_count < kMinMosaicCount || mosaic_start < kMinMosaicStart ||
+        !fs::exists(detect_dir, ec) || !fs::is_directory(detect_dir, ec)) {
+        return false;
+    }
 
-    // Build current fingerprint: detect images + mosaic count + start position
-    std::string detect_fp = FingerprintCache::compute_dir_fingerprint(detect_dir, "striking_");
-    std::string current_fp = "n=" + std::to_string(mosaic_count) +
-                             ",p=" + std::to_string(mosaic_start) + "\n" + detect_fp;
+    const fs::path mosaic_file = mosaic_dir / "mosaic.jpg";
+    const fs::path hash_file = mosaic_dir / ".mosaic_hash";
 
-    // Cache check: if mosaic exists and fingerprint matches, skip
-    if (fs::exists(mosaic_file)) {
-        std::string stored_fp = FingerprintCache::load(hash_file);
+    const std::string detect_fp =
+        FingerprintCache::compute_dir_fingerprint(detect_dir, kStrikingPrefix);
+    const std::string current_fp =
+        std::format("n={},p={}\n{}", mosaic_count, mosaic_start, detect_fp);
+
+    if (fs::exists(mosaic_file, ec)) {
+        const std::string stored_fp = FingerprintCache::load(hash_file);
         if (!stored_fp.empty() && stored_fp == current_fp) {
-            BOOST_LOG_TRIVIAL(info) << "  Mosaic cache hit — inputs unchanged, skipping regeneration";
+            BOOST_LOG_TRIVIAL(info)
+                << "  Mosaic cache hit — inputs unchanged, skipping regeneration";
             return true;
         }
-        // Inputs changed → regenerate
         BOOST_LOG_TRIVIAL(info) << "  Mosaic inputs changed, regenerating...";
     }
 
-    // Collect striking frames sorted by name (already time-ordered)
+    fs::directory_iterator dir_it(detect_dir, ec);
+    if (ec) {
+        return false;
+    }
+
     std::vector<fs::path> striking_files;
-    for (const auto& entry : fs::directory_iterator(detect_dir)) {
+    for (const auto& entry : dir_it) {
         if (entry.is_regular_file() &&
-            entry.path().extension() == ".jpg" &&
-            entry.path().filename().string().find("striking_") == 0) {
+            entry.path().extension() == kJpgExtension &&
+            entry.path().filename().string().starts_with(kStrikingPrefix)) {
             striking_files.push_back(entry.path());
         }
     }
-    std::sort(striking_files.begin(), striking_files.end());
+    std::ranges::sort(striking_files);
 
     if (striking_files.empty()) {
         BOOST_LOG_TRIVIAL(warning) << "  No striking frames found for mosaic";
         return false;
     }
 
-    int total = static_cast<int>(striking_files.size());
-
-    // Validate mosaic_start (1-indexed) is within range
+    const int total = static_cast<int>(striking_files.size());
     if (mosaic_start > total) {
-        BOOST_LOG_TRIVIAL(error) << "  Error: --mosaic start position P=" << mosaic_start
-                  << " is out of range (only " << total << " striking frame(s) available).";
+        BOOST_LOG_TRIVIAL(error) << std::format(
+            "  Error: --mosaic start position P={} is out of range (only {} striking frame(s) available).",
+            mosaic_start, total);
         return false;
     }
 
-    // Slice: only consider frames from position mosaic_start onward (1-indexed)
-    std::vector<fs::path> subset(striking_files.begin() + (mosaic_start - 1),
-                                 striking_files.end());
-    int available = static_cast<int>(subset.size());
+    const auto subset = std::span<const fs::path>{striking_files}.subspan(
+        static_cast<std::size_t>(mosaic_start - 1));
+    const int available = static_cast<int>(subset.size());
 
     if (available < mosaic_count) {
-        BOOST_LOG_TRIVIAL(error) << "  Error: Not enough striking frames from position P=" << mosaic_start
-                  << " for mosaic of N=" << mosaic_count
-                  << " (only " << available << " frame(s) available from that position).";
+        BOOST_LOG_TRIVIAL(error) << std::format(
+            "  Error: Not enough striking frames from position P={} for mosaic of N={} (only {} frame(s) available from that position).",
+            mosaic_start, mosaic_count, available);
         return false;
     }
 
-    // Select mosaic_count images evenly distributed across the subset
-    int n = mosaic_count;
-
     std::vector<cv::Mat> images;
-    for (int i = 0; i < n; ++i) {
-        int idx = (n == 1) ? 0
-                : static_cast<int>(std::round(
-                      static_cast<double>(i) * (available - 1) / (n - 1)));
+    images.reserve(static_cast<std::size_t>(mosaic_count));
+    for (const int i : std::views::iota(0, mosaic_count)) {
+        int idx = (mosaic_count == 1)
+                      ? 0
+                      : static_cast<int>(std::round(
+                            static_cast<double>(i) * (available - 1) / (mosaic_count - 1)));
         idx = std::min(idx, available - 1);
-        cv::Mat img = cv::imread(subset[idx].string());
+        cv::Mat img = cv::imread(subset[static_cast<std::size_t>(idx)].string());
         if (!img.empty()) {
-            images.push_back(img);
+            images.push_back(std::move(img));
         }
     }
 
@@ -93,29 +116,23 @@ bool MosaicBuilder::build(const fs::path& detect_dir,
         return false;
     }
 
-    // Mosaic canvas: HD resolution
-    int canvas_w = 1920;
-    int canvas_h = 1080;
-    cv::Mat canvas(canvas_h, canvas_w, CV_8UC3, cv::Scalar(0, 0, 0));
+    cv::Mat canvas(kCanvasHeight, kCanvasWidth, CV_8UC3, cv::Scalar(0, 0, 0));
 
-    int actual_n = static_cast<int>(images.size());
+    const int actual_n = static_cast<int>(images.size());
+    const int cols = static_cast<int>(std::ceil(std::sqrt(static_cast<double>(actual_n))));
+    const int rows = (actual_n + cols - 1) / cols;
+    const int cell_h = kCanvasHeight / rows;
 
-    // Uniform grid: cols = ceil(sqrt(N)), rows = ceil(N/cols)
-    // Last row images stretch wider to fill the full canvas width
-    int cols = static_cast<int>(std::ceil(std::sqrt(static_cast<double>(actual_n))));
-    int rows = (actual_n + cols - 1) / cols;
-    int cell_h = canvas_h / rows;
+    std::size_t img_idx = 0;
+    for (const int r : std::views::iota(0, rows)) {
+        const int items_in_row = std::min(cols, actual_n - r * cols);
+        const int cell_w = kCanvasWidth / items_in_row;
+        const int y = r * cell_h;
+        const int h = (r == rows - 1) ? (kCanvasHeight - y) : cell_h;
 
-    int img_idx = 0;
-    for (int r = 0; r < rows; ++r) {
-        int items_in_row = std::min(cols, actual_n - r * cols);
-        int cell_w = canvas_w / items_in_row;
-        int y = r * cell_h;
-        int h = (r == rows - 1) ? (canvas_h - y) : cell_h;
-
-        for (int c = 0; c < items_in_row; ++c) {
-            int x = c * cell_w;
-            int w = (c == items_in_row - 1) ? (canvas_w - x) : cell_w;
+        for (const int c : std::views::iota(0, items_in_row)) {
+            const int x = c * cell_w;
+            const int w = (c == items_in_row - 1) ? (kCanvasWidth - x) : cell_w;
 
             cv::Mat cell;
             cv::resize(images[img_idx], cell, cv::Size(w, h));
@@ -125,16 +142,14 @@ bool MosaicBuilder::build(const fs::path& detect_dir,
     }
 
     fs::create_directories(mosaic_dir);
-    std::string output_path = (mosaic_dir / "mosaic.jpg").string();
-    bool ok = cv::imwrite(output_path, canvas);
-
-    if (ok) {
-        BOOST_LOG_TRIVIAL(info) << "  Created mosaic (" << actual_n
-                  << " images) at " << output_path;
-        FingerprintCache::save(hash_file, current_fp);
-    } else {
+    const std::string output_path = mosaic_file.string();
+    if (!cv::imwrite(output_path, canvas)) {
         BOOST_LOG_TRIVIAL(warning) << "  Failed to write mosaic to " << output_path;
+        return false;
     }
 
-    return ok;
+    BOOST_LOG_TRIVIAL(info) << std::format(
+        "  Created mosaic ({} images) at {}", actual_n, output_path);
+    FingerprintCache::save(hash_file, current_fp);
+    return true;
 }

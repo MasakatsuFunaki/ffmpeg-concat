@@ -21,7 +21,7 @@ bool Ffmpeg::run_segment(const fs::path& in, const fs::path& out,
     return av::copy_segment(in, out, start_sec, end_sec);
 }
 
-bool Ffmpeg::concat(const std::vector<fs::path>& inputs, const fs::path& out,
+bool Ffmpeg::concat(std::span<const fs::path> inputs, const fs::path& out,
                     double total_sec, ProgressReporter& rep) const {
     return av::concat_copy(inputs, out, rep, total_sec);
 }

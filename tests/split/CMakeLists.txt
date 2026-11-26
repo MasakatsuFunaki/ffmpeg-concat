@@ -1,1 +1,1 @@
-add_test_target(test_split LIBS split_lib LABELS CT)
+add_test_target(test_split LIBS split_lib concat_lib LABELS CT)

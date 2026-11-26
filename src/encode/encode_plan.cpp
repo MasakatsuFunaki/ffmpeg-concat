@@ -1,83 +1,91 @@
 #include "encode/encode_plan.h"
 
+#include "core/format_util.h"
 #include "encode/encoder_catalog.h"
 #include "encode/encoder_profile.h"
 
 #include <algorithm>
-#include <sstream>
+#include <cstddef>
+#include <format>
+#include <ranges>
+#include <span>
+#include <string>
+#include <utility>
 
 namespace {
 
-// Rates that differ by less than this are the same rate seen through different
-// rounding, not a mix worth resampling.
-constexpr double FPS_EPSILON = 0.01;
+// Rates that differ by no more than this tolerance are treated as uniform.
+constexpr double kFpsEpsilon = 0.01;
 
 }  // namespace
 
-av::FrameRate lowest_fps_if_mixed(const std::vector<av::FrameRate>& rates) {
-    std::vector<av::FrameRate> known;
-    for (const auto& r : rates) {
-        if (r.known()) known.push_back(r);
+av::FrameRate lowest_fps_if_mixed(std::span<const av::FrameRate> rates) {
+    auto known = rates | std::views::filter(&av::FrameRate::known);
+    const auto [min_it, max_it] =
+        std::ranges::minmax_element(known, {}, &av::FrameRate::value);
+    if (min_it == max_it) {
+        return {};
     }
-    if (known.size() < 2) return {};
-
-    auto bounds = std::minmax_element(
-        known.begin(), known.end(),
-        [](const av::FrameRate& a, const av::FrameRate& b) { return a.value() < b.value(); });
-    if (bounds.second->value() - bounds.first->value() <= FPS_EPSILON) return {};  // uniform
-    return *bounds.first;
+    const av::FrameRate min_rate = *min_it;
+    const av::FrameRate max_rate = *max_it;
+    if (max_rate.value() - min_rate.value() <= kFpsEpsilon) {
+        return {};
+    }
+    return min_rate;
 }
 
 std::string build_filter_description(const EncodePlan& plan) {
+    if (plan.inputs.empty()) {
+        return {};
+    }
+
     const bool normalize = plan.target_fps.known();
-    // Emitted as an exact rational: "30/1", never "30.000000". libavfilter parses
-    // numbers through the C locale, and any library in the process (indicators
-    // among them) can switch that to comma-decimal mid-run.
-    const std::string rate = normalize ? std::to_string(plan.target_fps.num) + "/" +
-                                             std::to_string(plan.target_fps.den)
-                                       : "";
-    std::ostringstream filter;
+    // Exact rational "N/D" avoids lossy decimal formatting and locale issues.
+    const std::string rate = normalize
+        ? std::format("{}/{}", plan.target_fps.num, plan.target_fps.den)
+        : std::string{};
 
-    if (plan.inputs.size() < 2) {
-        // Nothing to join: pass the streams straight through, applying the rate
-        // change only if one was asked for.
-        filter << "[in0v]" << (normalize ? "fps=" + rate : "null") << "[outv];"
-               << "[in0a]anull[outa]";
-        return filter.str();
-    }
-
-    // The concat filter does no rate conversion, so segments recorded at
-    // different rates would join into a variable-frame-rate output. Normalize
-    // each input ahead of the concat instead, so every segment enters it at the
-    // same rate.
-    if (normalize) {
-        for (size_t i = 0; i < plan.inputs.size(); ++i) {
-            filter << "[in" << i << "v]fps=" << rate << "[v" << i << "];";
-        }
-    }
-    for (size_t i = 0; i < plan.inputs.size(); ++i) {
+    if (plan.inputs.size() == 1) {
         if (normalize) {
-            filter << "[v" << i << "]";
-        } else {
-            filter << "[in" << i << "v]";
+            return std::format("[in0v]fps={}[outv];[in0a]anull[outa]", rate);
         }
-        filter << "[in" << i << "a]";
+        return "[in0v]null[outv];[in0a]anull[outa]";
     }
-    filter << "concat=n=" << plan.inputs.size() << ":v=1:a=1[outv][outa]";
-    return filter.str();
+
+    const auto indices = std::views::iota(std::size_t{0}, plan.inputs.size());
+
+    std::string filter;
+    if (normalize) {
+        filter = core::join(
+            indices | std::views::transform([&rate](std::size_t i) {
+                return std::format("[in{}v]fps={}[v{}]", i, rate, i);
+            }),
+            ";");
+        filter.push_back(';');
+    }
+
+    filter += core::join(
+        indices | std::views::transform([normalize](std::size_t i) {
+            return normalize ? std::format("[v{}][in{}a]", i, i)
+                             : std::format("[in{}v][in{}a]", i, i);
+        }),
+        "");
+
+    filter += std::format("concat=n={}:v=1:a=1[outv][outa]", plan.inputs.size());
+    return filter;
 }
 
 av::TranscodeRequest build_request(const EncodePlan& plan) {
-    auto profile = EncoderCatalog::profile_for(plan.encoder);
+    const auto profile = EncoderCatalog::profile_for(plan.encoder);
     EncoderOptions encoder_options = profile->options(plan.crf, plan.preset);
 
     av::TranscodeRequest req;
-    req.inputs             = plan.inputs;
-    req.output             = plan.output;
+    req.inputs = plan.inputs;
+    req.output = plan.output;
     req.filter_description = build_filter_description(plan);
-    req.video_encoder      = profile->name();
-    req.video_options      = std::move(encoder_options.opts);
-    req.video_bit_rate     = encoder_options.bit_rate;
-    req.hwaccel_cuda       = plan.hwaccel_cuda;
+    req.video_encoder = profile->name();
+    req.video_options = std::move(encoder_options.opts);
+    req.video_bit_rate = encoder_options.bit_rate;
+    req.hwaccel_cuda = plan.hwaccel_cuda;
     return req;
 }

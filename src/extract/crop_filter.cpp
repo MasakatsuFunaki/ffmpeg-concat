@@ -3,31 +3,65 @@
 #include <opencv2/core.hpp>
 #include <opencv2/imgproc.hpp>
 
-// 1. Contrast check: reject near-uniform patches (plain backgrounds)
+namespace {
+
+constexpr double kMinContrastStddev = 25.0;
+constexpr double kCannyLowThreshold = 80.0;
+constexpr double kCannyHighThreshold = 160.0;
+constexpr double kMinEdgeRatio = 0.05;
+constexpr double kOtsuThreshold = 0.0;
+constexpr double kBinaryMaxValue = 255.0;
+constexpr double kWidthNormalizationPx = 100.0;
+constexpr double kMinComponentsPer100Px = 1.0;
+
+[[nodiscard]] bool is_non_empty_crop(const cv::Mat& crop_gray) noexcept {
+    return !crop_gray.empty() && crop_gray.cols > 0 && crop_gray.rows > 0;
+}
+
+}  // namespace
+
+CropFilter::~CropFilter() = default;
+
 bool ContrastFilter::accept(const cv::Mat& crop_gray) const {
-    cv::Scalar mean_val, stddev_val;
+    if (!is_non_empty_crop(crop_gray)) {
+        return false;
+    }
+
+    cv::Scalar mean_val;
+    cv::Scalar stddev_val;
     cv::meanStdDev(crop_gray, mean_val, stddev_val);
-    return stddev_val.val[0] >= 25.0;  // too uniform when below
+    return stddev_val.val[0] >= kMinContrastStddev;
 }
 
-// 2. Edge density check: text has many edge pixels from strokes
 bool EdgeDensityFilter::accept(const cv::Mat& crop_gray) const {
+    if (!is_non_empty_crop(crop_gray)) {
+        return false;
+    }
+
     cv::Mat edges;
-    cv::Canny(crop_gray, edges, 80, 160);
-    double edge_ratio = static_cast<double>(cv::countNonZero(edges))
-                      / (edges.rows * edges.cols);
-    return edge_ratio >= 0.05;  // too few edges for text when below
+    cv::Canny(crop_gray, edges, kCannyLowThreshold, kCannyHighThreshold);
+    const double total_pixels =
+        static_cast<double>(edges.rows) * static_cast<double>(edges.cols);
+    if (total_pixels <= 0.0) {
+        return false;
+    }
+
+    const double edge_ratio = static_cast<double>(cv::countNonZero(edges)) / total_pixels;
+    return edge_ratio >= kMinEdgeRatio;
 }
 
-// 3. Binary text check: threshold and count connected components.
-//    Real text produces many small separated components (characters).
 bool ComponentCountFilter::accept(const cv::Mat& crop_gray) const {
+    if (!is_non_empty_crop(crop_gray)) {
+        return false;
+    }
+
     cv::Mat binary;
-    cv::threshold(crop_gray, binary, 0, 255,
+    cv::threshold(crop_gray, binary, kOtsuThreshold, kBinaryMaxValue,
                   cv::THRESH_BINARY | cv::THRESH_OTSU);
     cv::Mat labels;
-    int num_components = cv::connectedComponents(binary, labels);
-    // Need at least a few components (characters) relative to crop width
-    double components_per_100px = (num_components - 1) * 100.0 / crop_gray.cols;
-    return components_per_100px >= 1.0;  // too few text-like components when below
+    const int num_components = cv::connectedComponents(binary, labels);
+    const double components_per_100px =
+        static_cast<double>(num_components - 1) * kWidthNormalizationPx /
+        static_cast<double>(crop_gray.cols);
+    return components_per_100px >= kMinComponentsPer100Px;
 }

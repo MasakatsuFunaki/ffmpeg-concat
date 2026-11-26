@@ -100,9 +100,9 @@ def main():
     parser.add_argument(
         "--tier",
         type=str.upper,
-        choices=["UT", "CT"],
+        choices=["UT", "CT", "ST"],
         default=None,
-        help="Run only the selected test tier (UT or CT via 'ctest -L <tier>'); implies --test",
+        help="Run only the selected test tier (UT, CT, or ST via 'ctest -L <tier>'); implies --test",
     )
     parser.add_argument(
         "--deploy",

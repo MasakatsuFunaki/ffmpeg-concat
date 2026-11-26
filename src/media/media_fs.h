@@ -1,35 +1,39 @@
 #pragma once
 
-// ---------------------------------------------------------------------------
-// media – free functions (deliberately NOT a pattern) for the filesystem-level
-// media chores: dating files, timestamping outputs, gathering video files,
-// building an ffmpeg concat list, and reporting an output's size.
-// ---------------------------------------------------------------------------
+// media – filesystem-level media helpers: dating files, timestamping outputs,
+// collecting sorted video inputs, and logging output sizes.
 
+#include <array>
 #include <ctime>
 #include <filesystem>
 #include <string>
+#include <string_view>
 #include <vector>
 
 namespace fs = std::filesystem;
 
 namespace media {
 
-// Extract date from filename (format: "YYYY-MM-DD HH-MM-SS") or fall back to last write time.
-std::time_t file_date(const fs::path& filepath);
+inline constexpr std::array<std::string_view, 9> kVideoExtensions{
+    ".mp4", ".avi", ".mkv", ".mov", ".wmv", ".flv", ".webm", ".ts", ".m4v"
+};
 
-// Generate a timestamp string for output filenames (format: "YYYY-MM-DD_HH-MM-SS").
-std::string current_timestamp();
+// Extract date from filename ("YYYY-MM-DD HH-MM-SS") or fall back to last write time.
+[[nodiscard]] std::time_t file_date(const fs::path& filepath);
 
-// Collect all video files (mp4, avi, mkv, mov, wmv, flv, webm, ts, m4v) sorted by date.
-std::vector<fs::path> collect_video_files(const fs::path& input_dir);
+// Generate a local timestamp string for output filenames ("YYYY-MM-DD_HH-MM-SS").
+[[nodiscard]] std::string current_timestamp();
 
-// Collect .mp4 files from a directory, sorted by date extracted from filename.
-std::vector<fs::path> collect_mp4_files(const fs::path& input_dir);
+// Collect video files matching kVideoExtensions (case-insensitively), sorted
+// ascending by file_date with deterministic path tie-breaking. Returns empty
+// if input_dir does not exist or is not a directory.
+[[nodiscard]] std::vector<fs::path> collect_video_files(const fs::path& input_dir);
 
-// Create the FFmpeg concat demuxer list file. Returns path to the list file.
+// Collect .mp4 files (case-insensitively), sorted ascending by file_date with
+// deterministic path tie-breaking. Returns empty if input_dir is missing/non-dir.
+[[nodiscard]] std::vector<fs::path> collect_mp4_files(const fs::path& input_dir);
 
-// Log the standard success + output-size lines. Used by concat/cut/transcode.
+// Log the standard success and output-size lines for an output artifact.
 void log_output_size(const fs::path& output_file);
 
 }  // namespace media

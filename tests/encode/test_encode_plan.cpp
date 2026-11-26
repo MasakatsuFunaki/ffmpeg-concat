@@ -1,214 +1,296 @@
-#include <gtest/gtest.h>
 #include "encode/encode_plan.h"
+#include "encode/encoder_catalog.h"
+#include "encode/encoder_profile.h"
+#include "av/av_capabilities.h"
+
+#include <gtest/gtest.h>
 
 #include <algorithm>
+#include <array>
+#include <cstddef>
+#include <ranges>
+#include <span>
 #include <string>
+#include <string_view>
+#include <utility>
 #include <vector>
 
-// ---------- helpers ----------
+namespace {
 
-using Options = std::vector<std::pair<std::string, std::string>>;
+using OptionList = std::vector<std::pair<std::string, std::string>>;
 
-static std::string option_value(const Options& opts, const std::string& key) {
-    for (const auto& kv : opts) {
-        if (kv.first == key) return kv.second;
+constexpr av::FrameRate kFps60{60, 1};
+constexpr av::FrameRate kFps50{50, 1};
+constexpr av::FrameRate kFps30{30, 1};
+constexpr av::FrameRate kFps24{24, 1};
+constexpr av::FrameRate kFps2997{30000, 1001};
+constexpr av::FrameRate kFps2997Approx{2997, 100};
+constexpr av::FrameRate kFps60Over2{60, 2};
+constexpr av::FrameRate kUnprobed{0, 0};
+
+[[nodiscard]] std::string_view find_option(const OptionList& opts,
+                                           std::string_view key) noexcept {
+    const auto it = std::ranges::find_if(
+        opts, [key](const auto& kv) { return kv.first == key; });
+    if (it == opts.end()) {
+        return {};
     }
-    return "";
+    return it->second;
 }
 
-static bool has_option(const Options& opts, const std::string& key) {
-    return std::any_of(opts.begin(), opts.end(),
-                       [&](const auto& kv) { return kv.first == key; });
+[[nodiscard]] bool has_option(const OptionList& opts, std::string_view key) noexcept {
+    return std::ranges::any_of(opts, [key](const auto& kv) { return kv.first == key; });
 }
 
-static EncodePlan two_input_plan() {
+[[nodiscard]] EncodePlan make_base_plan(std::size_t input_count) {
     EncodePlan plan;
-    plan.inputs  = {"first.mp4", "second.mp4"};
-    plan.output  = "out.mp4";
+    for (std::size_t i = 0; i < input_count; ++i) {
+        plan.inputs.emplace_back("in" + std::to_string(i) + ".mp4");
+    }
+    plan.output = "out.mp4";
     plan.encoder = "libx264";
-    plan.crf     = 30;
-    plan.preset  = "ultrafast";
+    plan.crf = 30;
+    plan.preset = "ultrafast";
     return plan;
 }
 
-// ---------- lowest_fps_if_mixed ----------
+}  // namespace
 
-static const av::FrameRate FPS_60{60, 1};
-static const av::FrameRate FPS_50{50, 1};
-static const av::FrameRate FPS_30{30, 1};
-static const av::FrameRate FPS_24{24, 1};
-static const av::FrameRate FPS_2997{30000, 1001};
-static const av::FrameRate UNPROBED{};
+TEST(LowestFpsIfMixedTest, TableCoversEmptyUniformNoiseInvalidAndOrderIndependence) {
+    struct LowestFpsCase {
+        std::string_view label;
+        std::array<av::FrameRate, 5> rates;
+        std::size_t count;
+        bool expected_known;
+        av::FrameRate expected_rate;
+    };
 
-TEST(LowestFpsIfMixed, PicksLowestWhenRatesDiffer) {
-    EXPECT_DOUBLE_EQ(30.0, lowest_fps_if_mixed({FPS_30, FPS_60}).value());
+    constexpr std::array<LowestFpsCase, 11> kCases{{
+        {"empty", {{}}, 0, false, kUnprobed},
+        {"single_rate", {{kFps60}}, 1, false, kUnprobed},
+        {"unprobed_plus_single", {{kUnprobed, kFps60}}, 2, false, kUnprobed},
+        {"all_invalid_or_unprobed",
+         {{kUnprobed, av::FrameRate{-30, 1}, av::FrameRate{30, 0}}},
+         3,
+         false,
+         kUnprobed},
+        {"uniform_rates", {{kFps30, kFps30, kFps30}}, 3, false, kUnprobed},
+        {"unreduced_equivalent_60_over_2_and_30_over_1",
+         {{kFps60Over2, kFps30}},
+         2,
+         false,
+         kUnprobed},
+        {"rounding_noise_ntsc_vs_2997_over_100",
+         {{kFps2997, kFps2997Approx}},
+         2,
+         false,
+         kUnprobed},
+        {"genuine_difference_30_vs_ntsc", {{kFps30, kFps2997}}, 2, true, kFps2997},
+        {"order_independent_four_rates",
+         {{kFps60, kFps30, kFps24, kFps50}},
+         4,
+         true,
+         kFps24},
+        {"invalid_negative_and_zero_entries_ignored",
+         {{av::FrameRate{-30, 1}, av::FrameRate{30, -1}, av::FrameRate{0, 1}, kFps60, kFps30}},
+         5,
+         true,
+         kFps30},
+        {"preserves_exact_ntsc_rational_when_higher_first",
+         {{kFps60, kFps2997}},
+         2,
+         true,
+         kFps2997},
+    }};
+
+    for (const auto& tc : kCases) {
+        SCOPED_TRACE(tc.label);
+        const std::span<const av::FrameRate> rate_span{tc.rates.data(), tc.count};
+        const av::FrameRate actual = lowest_fps_if_mixed(rate_span);
+        EXPECT_EQ(actual.known(), tc.expected_known);
+        if (tc.expected_known) {
+            EXPECT_EQ(actual, tc.expected_rate);
+        }
+    }
+
+    // Exercise the initializer_list overload explicitly as well.
+    EXPECT_EQ(lowest_fps_if_mixed({kFps60, kFps30}), kFps30);
+    EXPECT_FALSE(lowest_fps_if_mixed(std::initializer_list<av::FrameRate>{}).known());
 }
 
-TEST(LowestFpsIfMixed, IsOrderIndependent) {
-    // The lowest rate must win even when the highest is the first segment.
-    EXPECT_DOUBLE_EQ(30.0, lowest_fps_if_mixed({FPS_60, FPS_30}).value());
-    EXPECT_DOUBLE_EQ(24.0, lowest_fps_if_mixed({FPS_60, FPS_30, FPS_24, FPS_50}).value());
+TEST(BuildFilterDescriptionTest, TableCoversEmptySingleMultiAndExactRationals) {
+    struct FilterCase {
+        std::string_view label;
+        std::size_t input_count;
+        av::FrameRate target_fps;
+        std::string_view expected;
+    };
+
+    constexpr std::array<FilterCase, 7> kCases{{
+        {"empty_inputs_no_fps", 0, kUnprobed, ""},
+        {"empty_inputs_with_fps", 0, kFps30, ""},
+        {"single_input_passthrough",
+         1,
+         kUnprobed,
+         "[in0v]null[outv];[in0a]anull[outa]"},
+        {"single_input_with_fps",
+         1,
+         kFps30,
+         "[in0v]fps=30/1[outv];[in0a]anull[outa]"},
+        {"two_inputs_plain_concat",
+         2,
+         kUnprobed,
+         "[in0v][in0a][in1v][in1a]concat=n=2:v=1:a=1[outv][outa]"},
+        {"two_inputs_normalized_fps",
+         2,
+         kFps30,
+         "[in0v]fps=30/1[v0];[in1v]fps=30/1[v1];"
+         "[v0][in0a][v1][in1a]concat=n=2:v=1:a=1[outv][outa]"},
+        {"three_inputs_exact_ntsc_rational",
+         3,
+         kFps2997,
+         "[in0v]fps=30000/1001[v0];[in1v]fps=30000/1001[v1];[in2v]fps=30000/1001[v2];"
+         "[v0][in0a][v1][in1a][v2][in2a]concat=n=3:v=1:a=1[outv][outa]"},
+    }};
+
+    for (const auto& tc : kCases) {
+        SCOPED_TRACE(tc.label);
+        EncodePlan plan = make_base_plan(tc.input_count);
+        plan.target_fps = tc.target_fps;
+
+        const std::string filter = build_filter_description(plan);
+        EXPECT_EQ(filter, tc.expected);
+        EXPECT_EQ(filter.find('.'), std::string::npos);
+        EXPECT_EQ(filter.find(','), std::string::npos);
+    }
 }
 
-TEST(LowestFpsIfMixed, ReturnsUnknownWhenRatesAgree) {
-    EXPECT_FALSE(lowest_fps_if_mixed({FPS_30, FPS_30, FPS_30}).known());
-}
+TEST(BuildRequestTest, MapsPlanFieldsAndHandWrittenFilterGraph) {
+    constexpr std::string_view kExpectedFilter =
+        "[in0v]fps=30/1[v0];[in1v]fps=30/1[v1];"
+        "[v0][in0a][v1][in1a]concat=n=2:v=1:a=1[outv][outa]";
+    constexpr int64_t kExpectedAudioBitRate = 192000;
 
-TEST(LowestFpsIfMixed, ToleratesRoundingNoise) {
-    // 30000/1001 and 29.97 are the same rate; that is not a mix worth resampling.
-    EXPECT_FALSE(lowest_fps_if_mixed({FPS_2997, av::FrameRate{2997, 100}}).known());
-    // ...but a genuine 29.97 vs 30 difference is.
-    EXPECT_TRUE(lowest_fps_if_mixed({FPS_30, FPS_2997}).known());
-    EXPECT_NEAR(29.97, lowest_fps_if_mixed({FPS_30, FPS_2997}).value(), 0.001);
-}
+    EncodePlan default_plan = make_base_plan(2);
+    const av::TranscodeRequest default_req = build_request(default_plan);
+    EXPECT_FALSE(default_req.hwaccel_cuda);
+    EXPECT_FALSE(default_req.audio_copy);
+    EXPECT_EQ(default_req.filter_description,
+              "[in0v][in0a][in1v][in1a]concat=n=2:v=1:a=1[outv][outa]");
 
-TEST(LowestFpsIfMixed, PreservesTheExactRational) {
-    // 30000/1001 must survive as a rational; rounding it to 29.97 would drift.
-    av::FrameRate picked = lowest_fps_if_mixed({FPS_60, FPS_2997});
-    EXPECT_EQ(30000, picked.num);
-    EXPECT_EQ(1001, picked.den);
-}
+    EncodePlan gpu_plan = make_base_plan(2);
+    gpu_plan.hwaccel_cuda = true;
+    gpu_plan.target_fps = kFps30;
 
-TEST(LowestFpsIfMixed, NeedsTwoKnownRates) {
-    EXPECT_FALSE(lowest_fps_if_mixed({}).known());
-    EXPECT_FALSE(lowest_fps_if_mixed({FPS_60}).known());
-    EXPECT_FALSE(lowest_fps_if_mixed({UNPROBED, FPS_60}).known());  // one probe failed
-}
-
-TEST(LowestFpsIfMixed, IgnoresUnprobedEntries) {
-    // A file whose rate could not be read must not be mistaken for 0 fps.
-    EXPECT_DOUBLE_EQ(30.0, lowest_fps_if_mixed({UNPROBED, FPS_60, FPS_30}).value());
-}
-
-// ---------- build_filter_description ----------
-
-TEST(BuildFilterDescription, SingleInputPassesThrough) {
-    EncodePlan plan;
-    plan.inputs  = {"only.mp4"};
-    plan.output  = "out.mp4";
-    plan.encoder = "libx264";
-
-    // Still a graph, because the engine always reads from named pads.
-    EXPECT_EQ("[in0v]null[outv];[in0a]anull[outa]", build_filter_description(plan));
-}
-
-TEST(BuildFilterDescription, SingleInputStillHonoursATargetRate) {
-    EncodePlan plan;
-    plan.inputs     = {"only.mp4"};
-    plan.output     = "out.mp4";
-    plan.encoder    = "libx264";
-    plan.target_fps = FPS_30;
-
-    EXPECT_EQ("[in0v]fps=30/1[outv];[in0a]anull[outa]", build_filter_description(plan));
-}
-
-TEST(BuildFilterDescription, PlainConcatWhenNoNormalizationNeeded) {
-    std::string filter = build_filter_description(two_input_plan());
-
-    EXPECT_EQ("[in0v][in0a][in1v][in1a]concat=n=2:v=1:a=1[outv][outa]", filter);
-    EXPECT_EQ(std::string::npos, filter.find("fps="));
-}
-
-TEST(BuildFilterDescription, NormalizesEveryInputAheadOfConcat) {
-    EncodePlan plan = two_input_plan();
-    plan.target_fps = FPS_30;
-
-    // Both segments are rate-converted before the concat sees them — including
-    // the one already at the target rate, so the join is uniform either way.
-    EXPECT_EQ("[in0v]fps=30/1[v0];[in1v]fps=30/1[v1];"
-              "[v0][in0a][v1][in1a]concat=n=2:v=1:a=1[outv][outa]",
-              build_filter_description(plan));
-}
-
-TEST(BuildFilterDescription, ScalesToAnyInputCount) {
-    EncodePlan plan;
-    plan.inputs     = {"a.mp4", "b.mp4", "c.mp4"};
-    plan.output     = "out.mp4";
-    plan.encoder    = "libx264";
-    plan.target_fps = FPS_24;
-
-    EXPECT_EQ("[in0v]fps=24/1[v0];[in1v]fps=24/1[v1];[in2v]fps=24/1[v2];"
-              "[v0][in0a][v1][in1a][v2][in2a]concat=n=3:v=1:a=1[outv][outa]",
-              build_filter_description(plan));
-}
-
-TEST(BuildFilterDescription, EmitsRatesAsExactRationals) {
-    // Never a decimal: libavfilter parses numbers through the C locale, which a
-    // library in the process can switch to comma-decimal at any time. An NTSC
-    // rate must also survive exactly rather than round to 29.97.
-    EncodePlan plan = two_input_plan();
-    plan.target_fps = FPS_2997;
-
-    std::string filter = build_filter_description(plan);
-
-    EXPECT_NE(std::string::npos, filter.find("fps=30000/1001"));
-    EXPECT_EQ(std::string::npos, filter.find("."));
-    EXPECT_EQ(std::string::npos, filter.find(","));
-}
-
-// ---------- build_request ----------
-
-TEST(BuildRequest, CarriesThePlanThrough) {
-    EncodePlan plan = two_input_plan();
-    plan.hwaccel_cuda = true;
-    plan.target_fps   = FPS_30;
-
-    av::TranscodeRequest req = build_request(plan);
-
-    EXPECT_EQ(plan.inputs, req.inputs);
-    EXPECT_EQ(plan.output, req.output);
-    EXPECT_EQ("libx264", req.video_encoder);
+    const av::TranscodeRequest req = build_request(gpu_plan);
+    EXPECT_EQ(req.inputs, gpu_plan.inputs);
+    EXPECT_EQ(req.output, gpu_plan.output);
+    EXPECT_EQ(req.video_encoder, "libx264");
     EXPECT_TRUE(req.hwaccel_cuda);
-    EXPECT_EQ(build_filter_description(plan), req.filter_description);
-    EXPECT_EQ("aac", req.audio_encoder);
-    EXPECT_EQ(192000, req.audio_bit_rate);
+    EXPECT_EQ(req.filter_description, kExpectedFilter);
+    EXPECT_EQ(req.video_bit_rate, 0);
+    EXPECT_EQ(req.audio_encoder, "aac");
+    EXPECT_EQ(req.audio_bit_rate, kExpectedAudioBitRate);
+    EXPECT_FALSE(req.audio_copy);
 }
 
-TEST(BuildRequest, OmitsHwaccelByDefault) {
-    EXPECT_FALSE(build_request(two_input_plan()).hwaccel_cuda);
+TEST(BuildRequestTest, EncoderDialectMatrixCoversAllProfilesDefaultsAndCrfBoundaries) {
+    struct DialectCase {
+        std::string_view encoder;
+        int crf;
+        std::string_view preset;
+        std::string_view quality_key;
+        std::string_view expected_quality;
+        std::string_view speed_key;
+        std::string_view expected_speed;
+        std::string_view forbidden_key;
+    };
+
+    constexpr std::array<DialectCase, 12> kCases{{
+        {"av1_nvenc", 24, "p6", "cq", "24", "preset", "p6", "crf"},
+        {"av1_nvenc", 0, "", "cq", "0", "preset", "p4", "crf"},
+        {"h264_nvenc", 51, "p1", "cq", "51", "preset", "p1", "crf"},
+        {"h264_nvenc", 30, "", "cq", "30", "preset", "p4", "crf"},
+        {"libsvtav1", 35, "8", "crf", "35", "preset", "8", "cq"},
+        {"libsvtav1", 0, "", "crf", "0", "preset", "6", "cq"},
+        {"libx264", 23, "ultrafast", "crf", "23", "preset", "ultrafast", "cq"},
+        {"libx264", 51, "", "crf", "51", "preset", "medium", "cq"},
+        {"libaom-av1", 32, "2", "crf", "32", "cpu-used", "2", "preset"},
+        {"libaom-av1", 30, "", "crf", "30", "cpu-used", "4", "preset"},
+        {"custom_future_encoder", 28, "3", "crf", "28", "cpu-used", "3", "preset"},
+        {"custom_future_encoder", 30, "", "crf", "30", "cpu-used", "4", "preset"},
+    }};
+
+    for (const auto& tc : kCases) {
+        SCOPED_TRACE(std::string(tc.encoder) + ":" + std::string(tc.preset));
+        EncodePlan plan = make_base_plan(2);
+        plan.encoder = std::string(tc.encoder);
+        plan.crf = tc.crf;
+        plan.preset = std::string(tc.preset);
+
+        const av::TranscodeRequest req = build_request(plan);
+        EXPECT_EQ(req.video_encoder, tc.encoder);
+        EXPECT_EQ(req.video_bit_rate, 0);
+        ASSERT_EQ(req.video_options.size(), 2u);
+        EXPECT_EQ(find_option(req.video_options, tc.quality_key), tc.expected_quality);
+        EXPECT_EQ(find_option(req.video_options, tc.speed_key), tc.expected_speed);
+        EXPECT_FALSE(has_option(req.video_options, tc.forbidden_key));
+    }
 }
 
-TEST(BuildRequest, UsesTheNvencDialect) {
-    EncodePlan plan = two_input_plan();
-    plan.encoder = "av1_nvenc";
-    plan.crf     = 24;
-    plan.preset  = "p6";
+TEST(EncoderCatalogTest, ProfileForDispatchesAllKnownAndFallbackEncoders) {
+    struct ProfileCase {
+        std::string_view encoder;
+        int crf;
+        std::string_view preset;
+        std::string_view expected_name;
+        std::string_view quality_key;
+        std::string_view expected_quality;
+        std::string_view speed_key;
+        std::string_view expected_speed;
+    };
 
-    av::TranscodeRequest req = build_request(plan);
+    constexpr std::array<ProfileCase, 7> kCases{{
+        {"av1_nvenc", 28, "", "av1_nvenc", "cq", "28", "preset", "p4"},
+        {"h264_nvenc", 22, "p5", "h264_nvenc", "cq", "22", "preset", "p5"},
+        {"libsvtav1", 30, "", "libsvtav1", "crf", "30", "preset", "6"},
+        {"libx264", 18, "", "libx264", "crf", "18", "preset", "medium"},
+        {"libaom-av1", 34, "", "libaom-av1", "crf", "34", "cpu-used", "4"},
+        {"unknown_codec", 30, "5", "unknown_codec", "crf", "30", "cpu-used", "5"},
+        {"", 30, "", "", "crf", "30", "cpu-used", "4"},
+    }};
 
-    EXPECT_EQ("av1_nvenc", req.video_encoder);
-    EXPECT_EQ("24", option_value(req.video_options, "cq"));   // nvenc says cq, not crf
-    EXPECT_EQ("p6", option_value(req.video_options, "preset"));
-    EXPECT_FALSE(has_option(req.video_options, "crf"));
-    EXPECT_EQ(0, req.video_bit_rate);                          // quality-targeted
+    for (const auto& tc : kCases) {
+        SCOPED_TRACE(tc.encoder);
+        const auto profile = EncoderCatalog::profile_for(tc.encoder);
+        ASSERT_NE(profile, nullptr);
+        EXPECT_EQ(profile->name(), tc.expected_name);
+
+        const EncoderOptions opts = profile->options(tc.crf, tc.preset);
+        EXPECT_EQ(opts.bit_rate, 0);
+        ASSERT_EQ(opts.opts.size(), 2u);
+        EXPECT_EQ(find_option(opts.opts, tc.quality_key), tc.expected_quality);
+        EXPECT_EQ(find_option(opts.opts, tc.speed_key), tc.expected_speed);
+    }
 }
 
-TEST(BuildRequest, UsesTheX264Dialect) {
-    av::TranscodeRequest req = build_request(two_input_plan());
+TEST(EncoderCatalogTest, DetectReturnsUsableEncoderFromCandidateSet) {
+    constexpr std::array<std::string_view, 2> kH264Candidates{"h264_nvenc", "libx264"};
+    constexpr std::array<std::string_view, 3> kAv1Candidates{
+        "av1_nvenc", "libsvtav1", "libaom-av1"};
 
-    EXPECT_EQ("30", option_value(req.video_options, "crf"));
-    EXPECT_EQ("ultrafast", option_value(req.video_options, "preset"));
-    EXPECT_FALSE(has_option(req.video_options, "cq"));
-}
+    const std::string h264 = EncoderCatalog::detect("h264");
+    EXPECT_TRUE(std::ranges::find(kH264Candidates, h264) != kH264Candidates.end())
+        << "Unexpected h264 encoder: " << h264;
+    EXPECT_TRUE(av::can_use_encoder(h264));
 
-TEST(BuildRequest, UsesTheLibaomDialect) {
-    EncodePlan plan = two_input_plan();
-    plan.encoder = "libaom-av1";
-    plan.preset  = "";        // falls back to the profile default
+    const std::string av1 = EncoderCatalog::detect("av1");
+    EXPECT_TRUE(std::ranges::find(kAv1Candidates, av1) != kAv1Candidates.end())
+        << "Unexpected av1 encoder: " << av1;
+    EXPECT_TRUE(av::can_use_encoder(av1));
 
-    av::TranscodeRequest req = build_request(plan);
-
-    EXPECT_EQ("30", option_value(req.video_options, "crf"));
-    EXPECT_EQ("4", option_value(req.video_options, "cpu-used"));  // libaom's "preset"
-    EXPECT_FALSE(has_option(req.video_options, "preset"));
-}
-
-TEST(BuildRequest, FallsBackToLibaomForUnknownEncoders) {
-    EncodePlan plan = two_input_plan();
-    plan.encoder = "some_future_encoder";
-
-    av::TranscodeRequest req = build_request(plan);
-
-    EXPECT_EQ("some_future_encoder", req.video_encoder);
-    EXPECT_TRUE(has_option(req.video_options, "cpu-used"));
+    const std::string fallback = EncoderCatalog::detect("default_codec");
+    EXPECT_TRUE(std::ranges::find(kAv1Candidates, fallback) != kAv1Candidates.end())
+        << "Unexpected default encoder: " << fallback;
+    EXPECT_TRUE(av::can_use_encoder(fallback));
 }

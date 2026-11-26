@@ -2,15 +2,18 @@
 
 #include "common.h"
 
+#include <span>
+#include <string>
 #include <vector>
 
-class SplitApp : public ToolApp {
+class SplitApp final : public ToolApp {
 protected:
-    std::string name() const override;
+    [[nodiscard]] std::string name() const override;
     void define_options(boost::program_options::options_description& desc) override;
-    std::string extra_help() const override;
+    [[nodiscard]] std::string extra_help() const override;
     int execute(const boost::program_options::variables_map& vm) override;
 
 private:
-    std::vector<double> compute_absolute_points(const std::vector<double>& points, bool relative);
+    [[nodiscard]] static std::vector<double> compute_absolute_points(
+        std::span<const double> points, bool relative);
 };

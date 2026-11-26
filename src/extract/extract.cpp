@@ -1,10 +1,12 @@
 #include "extract.h"
 
-#include "extract/frame_extractor.h"
 #include "extract/equally_spaced_extractor.h"
+#include "extract/frame_extractor.h"
 #include "extract/striking_frame_extractor.h"
 #include "extract/text_crop_extractor.h"
 
+#include <cstddef>
+#include <format>
 #include <memory>
 #include <optional>
 #include <string>
@@ -13,6 +15,16 @@
 #include <boost/program_options.hpp>
 
 namespace po = boost::program_options;
+
+namespace {
+
+constexpr std::size_t kMaxMosaicArgs = 2;
+constexpr int kMinMosaicCount = 1;
+constexpr int kMinMosaicStart = 1;
+constexpr int kDefaultMosaicStart = 1;
+constexpr std::size_t kMaxExtractors = 3;
+
+}  // namespace
 
 std::string ExtractApp::name() const { return "Extract Frames"; }
 
@@ -41,59 +53,64 @@ std::string ExtractApp::extra_help() const {
 }
 
 int ExtractApp::execute(const po::variables_map& vm) {
-    bool do_image  = vm.count("image") > 0;
-    bool do_detect = vm.count("image-detect") > 0;
-    bool do_text   = vm.count("extract-text") > 0;
-    bool do_mosaic = vm.count("mosaic") > 0;
-    int num_samples = do_image ? vm["image"].as<int>() : 0;
-    int mosaic_count = 0;
-    int mosaic_start = 1;
+    const bool do_image = vm.count("image") > 0;
+    const bool do_detect = vm.count("image-detect") > 0;
+    const bool do_text = vm.count("extract-text") > 0;
+    const bool do_mosaic = vm.count("mosaic") > 0;
+    const int num_samples = do_image ? vm["image"].as<int>() : 0;
+
+    std::optional<MosaicSpec> mosaic;
     if (do_mosaic) {
-        auto mosaic_args = vm["mosaic"].as<std::vector<int>>();
-        if (mosaic_args.empty() || mosaic_args.size() > 2) {
-            BOOST_LOG_TRIVIAL(error) << "Error: --mosaic expects 1 or 2 arguments: <N> [P] (got " << mosaic_args.size() << ").";
+        const auto& mosaic_args = vm["mosaic"].as<std::vector<int>>();
+        if (mosaic_args.empty() || mosaic_args.size() > kMaxMosaicArgs) {
+            BOOST_LOG_TRIVIAL(error) << std::format(
+                "Error: --mosaic expects 1 or 2 arguments: <N> [P] (got {}).",
+                mosaic_args.size());
             return 1;
         }
-        mosaic_count = mosaic_args[0];
-        if (mosaic_args.size() == 2) {
-            mosaic_start = mosaic_args[1];
-        }
+        const int count = mosaic_args[0];
+        const int start =
+            (mosaic_args.size() == kMaxMosaicArgs) ? mosaic_args[1] : kDefaultMosaicStart;
+        mosaic = MosaicSpec{count, start};
     }
 
     if (!do_image && !do_detect && !do_text) {
-        BOOST_LOG_TRIVIAL(error) << "Error: Specify at least --image <N>, --image-detect, or --extract-text.";
+        BOOST_LOG_TRIVIAL(error)
+            << "Error: Specify at least --image <N>, --image-detect, or --extract-text.";
         return 1;
     }
 
     if (do_image && num_samples <= 0) {
-        BOOST_LOG_TRIVIAL(error) << "Error: --image requires a positive integer (got " << num_samples << ").";
+        BOOST_LOG_TRIVIAL(error) << std::format(
+            "Error: --image requires a positive integer (got {}).", num_samples);
         return 1;
     }
 
-    if (do_mosaic && mosaic_count < 1) {
-        BOOST_LOG_TRIVIAL(error) << "Error: --mosaic requires a positive integer >= 1 (got " << mosaic_count << ").";
+    if (mosaic && mosaic->count < kMinMosaicCount) {
+        BOOST_LOG_TRIVIAL(error) << std::format(
+            "Error: --mosaic requires a positive integer >= 1 (got {}).", mosaic->count);
         return 1;
     }
 
-    if (do_mosaic && mosaic_start < 1) {
-        BOOST_LOG_TRIVIAL(error) << "Error: --mosaic start position P must be >= 1 (got " << mosaic_start << ").";
+    if (mosaic && mosaic->start < kMinMosaicStart) {
+        BOOST_LOG_TRIVIAL(error) << std::format(
+            "Error: --mosaic start position P must be >= 1 (got {}).", mosaic->start);
         return 1;
     }
 
-    if (do_mosaic && !do_detect) {
-        BOOST_LOG_TRIVIAL(error) << "Error: --mosaic requires --image-detect to be specified.";
+    if (mosaic && !do_detect) {
+        BOOST_LOG_TRIVIAL(error)
+            << "Error: --mosaic requires --image-detect to be specified.";
         return 1;
     }
 
-    fs::path input_path  = fs::absolute(vm["input"].as<std::string>());
-    fs::path output_dir  = fs::absolute(vm["output"].as<std::string>());
+    const fs::path input_path = fs::absolute(vm["input"].as<std::string>());
+    const fs::path output_dir = fs::absolute(vm["output"].as<std::string>());
 
     if (!fs::exists(input_path)) {
         BOOST_LOG_TRIVIAL(error) << "Error: Input path does not exist: " << input_path;
         return 1;
     }
-
-    fs::create_directories(output_dir);
 
     std::vector<fs::path> video_files;
     if (fs::is_regular_file(input_path)) {
@@ -101,7 +118,8 @@ int ExtractApp::execute(const po::variables_map& vm) {
     } else if (fs::is_directory(input_path)) {
         video_files = FFmpegUtils::collect_video_files(input_path);
     } else {
-        BOOST_LOG_TRIVIAL(error) << "Error: Input is neither a file nor a directory: " << input_path;
+        BOOST_LOG_TRIVIAL(error)
+            << "Error: Input is neither a file nor a directory: " << input_path;
         return 1;
     }
 
@@ -110,46 +128,49 @@ int ExtractApp::execute(const po::variables_map& vm) {
         return 1;
     }
 
-    BOOST_LOG_TRIVIAL(info) << "Found " << video_files.size() << " video file(s):";
+    fs::create_directories(output_dir);
+
+    BOOST_LOG_TRIVIAL(info) << std::format("Found {} video file(s):", video_files.size());
     for (const auto& f : video_files) {
         BOOST_LOG_TRIVIAL(info) << "  - " << f.filename().string();
     }
 
-    // Build the extraction strategies in mode order: image -> striking -> text.
+    // Build extraction strategies in mode order: image -> striking -> text.
     std::vector<std::unique_ptr<FrameExtractor>> extractors;
+    extractors.reserve(kMaxExtractors);
     if (do_image) {
         extractors.push_back(std::make_unique<EquallySpacedExtractor>(num_samples));
     }
     if (do_detect) {
-        std::optional<MosaicSpec> mosaic;
-        if (do_mosaic) mosaic = MosaicSpec{mosaic_count, mosaic_start};
         extractors.push_back(std::make_unique<StrikingFrameExtractor>(mosaic));
     }
     if (do_text) {
         extractors.push_back(std::make_unique<TextCropExtractor>());
     }
 
-    Ffmpeg runner;
+    const Ffmpeg runner;
     bool all_ok = true;
 
     for (const auto& video : video_files) {
-        std::string video_stem = video.stem().string();
-        fs::path video_out_dir = output_dir / video_stem;
+        const fs::path video_out_dir = output_dir / video.stem();
         fs::create_directories(video_out_dir);
 
-        BOOST_LOG_TRIVIAL(info) << "=== Processing: " << video.filename().string() << " ===";
+        BOOST_LOG_TRIVIAL(info) << std::format(
+            "=== Processing: {} ===", video.filename().string());
 
-        // Run every mode regardless of earlier failures (no short-circuit).
-        for (auto& ex : extractors) {
-            bool ok = ex->run(runner, video, video_out_dir);
-            if (!ok) all_ok = false;
+        // Execute every mode without short-circuiting earlier failures.
+        for (const auto& ex : extractors) {
+            if (!ex->run(runner, video, video_out_dir)) {
+                all_ok = false;
+            }
         }
     }
 
     if (all_ok) {
         BOOST_LOG_TRIVIAL(info) << "Success! All frames extracted to: " << output_dir;
     } else {
-        BOOST_LOG_TRIVIAL(info) << "Completed with some warnings. Check output in: " << output_dir;
+        BOOST_LOG_TRIVIAL(info)
+            << "Completed with some warnings. Check output in: " << output_dir;
     }
 
     return all_ok ? 0 : 1;

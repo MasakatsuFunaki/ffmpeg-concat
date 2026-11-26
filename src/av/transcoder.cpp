@@ -1,24 +1,36 @@
 #include "av/transcoder.h"
 
 #include "av/av_error.h"
+#include "av/av_handles.h"
+#include "core/format_util.h"
+#include "core/scoped_handle.h"
 #include "ffmpeg/progress_reporter.h"
 
 #include <boost/log/trivial.hpp>
 
 #include <algorithm>
+#include <array>
 #include <chrono>
 #include <clocale>
-#include <cstdio>
+#include <concepts>
+#include <cstddef>
+#include <cstdint>
+#include <exception>
+#include <format>
+#include <limits>
 #include <memory>
-#include <sstream>
-#include <iomanip>
+#include <ranges>
+#include <span>
+#include <string>
+#include <string_view>
+#include <system_error>
+#include <type_traits>
+#include <utility>
+#include <vector>
 
 extern "C" {
-#include <libavcodec/avcodec.h>
-#include <libavfilter/avfilter.h>
 #include <libavfilter/buffersink.h>
 #include <libavfilter/buffersrc.h>
-#include <libavformat/avformat.h>
 #include <libavutil/channel_layout.h>
 #include <libavutil/hwcontext.h>
 #include <libavutil/opt.h>
@@ -26,75 +38,68 @@ extern "C" {
 }
 
 namespace av {
+
 namespace {
 
-// --------------------------------------------------------------------------
-// Locale
-// --------------------------------------------------------------------------
+constexpr int kNoStreamIndex = -1;
+constexpr int kAutoStreamIndex = -1;
+constexpr int kAutoThreadCount = 0;
+constexpr unsigned kPrimaryPadIndex = 0;
+constexpr std::int64_t kUnknownPacketPos = -1;
+constexpr std::size_t kChannelLayoutBufSize = 128;
+constexpr AVRational kDefaultSar{1, 1};
+constexpr std::chrono::milliseconds kProgressInterval{200};
+constexpr std::string_view kVideoOutPad = "outv";
+constexpr std::string_view kAudioOutPad = "outa";
 
-// libavfilter parses every number in a graph description through the C locale,
-// and libraries in this process switch it: indicators calls setlocale, which on
-// a European system makes "." stop being the decimal separator and breaks filter
-// arguments. As a subprocess ffmpeg was insulated from that; linked in, it is
-// not. Pin LC_NUMERIC for as long as libav* is parsing.
-class ScopedCNumeric {
-public:
-    ScopedCNumeric() {
-        const char* current = std::setlocale(LC_NUMERIC, nullptr);
-        if (current) saved_ = current;
-        std::setlocale(LC_NUMERIC, "C");
+// libavfilter parses numeric filter arguments using the process C locale,
+// which third-party terminal libraries (e.g. indicators) can switch to a
+// comma-decimal locale. Pin LC_NUMERIC to "C" for the duration of a transcode.
+[[nodiscard]] auto pin_c_numeric_locale() {
+    std::string saved;
+    if (const char* current = std::setlocale(LC_NUMERIC, nullptr)) {
+        saved = current;
     }
-    ~ScopedCNumeric() {
-        if (!saved_.empty()) std::setlocale(LC_NUMERIC, saved_.c_str());
-    }
-    ScopedCNumeric(const ScopedCNumeric&) = delete;
-    ScopedCNumeric& operator=(const ScopedCNumeric&) = delete;
+    std::setlocale(LC_NUMERIC, "C");
+    return core::make_scope_guard([saved = std::move(saved)]() noexcept {
+        if (!saved.empty()) {
+            std::setlocale(LC_NUMERIC, saved.c_str());
+        }
+    });
+}
 
-private:
-    std::string saved_;
-};
-
-// --------------------------------------------------------------------------
-// RAII
-// --------------------------------------------------------------------------
-
-struct FrameDeleter { void operator()(AVFrame* f) const { av_frame_free(&f); } };
-struct PacketDeleter { void operator()(AVPacket* p) const { av_packet_free(&p); } };
-using FramePtr  = std::unique_ptr<AVFrame, FrameDeleter>;
-using PacketPtr = std::unique_ptr<AVPacket, PacketDeleter>;
-
-FramePtr  new_frame()  { return FramePtr(av_frame_alloc()); }
-PacketPtr new_packet() { return PacketPtr(av_packet_alloc()); }
-
-// --------------------------------------------------------------------------
-// Hardware decoding
-// --------------------------------------------------------------------------
-
-// Chosen by libavcodec once it knows the stream's real formats. Taking CUDA
-// keeps decoding on NVDEC; returning the first entry otherwise is the software
-// fallback, which is what happens for any codec NVDEC does not implement.
+// Callback invoked by libavcodec once stream pixel formats are known. Picking
+// CUDA keeps decoding on NVDEC; otherwise fall back to the first software fmt.
 AVPixelFormat pick_cuda(AVCodecContext*, const AVPixelFormat* formats) {
     std::string offered;
     for (const AVPixelFormat* p = formats; *p != AV_PIX_FMT_NONE; ++p) {
         const char* name = av_get_pix_fmt_name(*p);
-        offered += std::string(offered.empty() ? "" : ", ") + (name ? name : "?");
+        if (!offered.empty()) {
+            offered += ", ";
+        }
+        offered += (name ? name : "?");
         if (*p == AV_PIX_FMT_CUDA) {
             BOOST_LOG_TRIVIAL(debug) << "Decoding on the GPU (offered: " << offered << "...)";
             return *p;
         }
     }
     BOOST_LOG_TRIVIAL(warning) << "GPU decoding unavailable for this stream, using software "
-                                  "(offered: " << offered << ")";
+                                  "(offered: "
+                               << offered << ")";
     return formats[0];
 }
 
-// Bring a GPU-resident frame back to system memory; software frames pass through.
-FramePtr to_software(FramePtr frame) {
-    if (!frame || frame->format != AV_PIX_FMT_CUDA) return frame;
+// Downloads a GPU-resident frame to system memory; software frames pass through.
+[[nodiscard]] detail::FramePtr to_software(detail::FramePtr frame) {
+    if (!frame || frame->format != AV_PIX_FMT_CUDA) {
+        return frame;
+    }
 
-    FramePtr sw = new_frame();
-    if (!sw) return nullptr;
-    int rc = av_hwframe_transfer_data(sw.get(), frame.get(), 0);
+    detail::FramePtr sw = detail::make_frame();
+    if (!sw) {
+        return nullptr;
+    }
+    const int rc = av_hwframe_transfer_data(sw.get(), frame.get(), 0);
     if (rc < 0) {
         BOOST_LOG_TRIVIAL(error) << "Could not download frame from GPU: " << err_str(rc);
         return nullptr;
@@ -103,55 +108,48 @@ FramePtr to_software(FramePtr frame) {
     return sw;
 }
 
-// --------------------------------------------------------------------------
-// Encoder capability queries
-// --------------------------------------------------------------------------
-
 template <typename T>
-std::vector<T> supported(const AVCodec* codec, AVCodecConfig config) {
+    requires std::is_enum_v<T> || std::integral<T>
+[[nodiscard]] std::vector<T> supported(const AVCodec* codec, AVCodecConfig config) {
     const void* list = nullptr;
     int count = 0;
     if (avcodec_get_supported_config(nullptr, codec, config, 0, &list, &count) < 0 || !list) {
         return {};
     }
-    const T* typed = static_cast<const T*>(list);
-    // A null-terminated list is reported with count == 0 by some codecs.
+    const auto* typed = static_cast<const T*>(list);
+    // Some codecs report a sentinel-terminated list with count == 0.
     if (count <= 0) {
         std::vector<T> out;
-        for (int i = 0; typed[i] != static_cast<T>(-1); ++i) out.push_back(typed[i]);
+        for (int i = 0; typed[i] != static_cast<T>(-1); ++i) {
+            out.push_back(typed[i]);
+        }
         return out;
     }
-    return std::vector<T>(typed, typed + count);
+    const std::span<const T> items{typed, static_cast<std::size_t>(count)};
+    return {items.begin(), items.end()};
 }
 
-// --------------------------------------------------------------------------
-// One opened input file
-// --------------------------------------------------------------------------
-
+// Opened input file and its associated decoders and priming buffers (Rule of Zero).
+// Reverse member destruction frees queued frames/packets -> vdec -> adec -> fmt.
 struct Input {
-    AVFormatContext* fmt = nullptr;
-    int v_index = -1;
-    int a_index = -1;
-    AVCodecContext* vdec = nullptr;
-    AVCodecContext* adec = nullptr;
-    AVFilterContext* vsrc = nullptr;   // owned by the graph
-    AVFilterContext* asrc = nullptr;   // owned by the graph
-    std::vector<FramePtr> queued_v;    // decoded before the graph existed
-    std::vector<FramePtr> queued_a;
-    std::vector<PacketPtr> queued_pkts;  // audio read while priming, when copying
-
-    ~Input() {
-        if (vdec) avcodec_free_context(&vdec);
-        if (adec) avcodec_free_context(&adec);
-        if (fmt) avformat_close_input(&fmt);
-    }
+    detail::FormatInputPtr fmt;
+    int v_index = kNoStreamIndex;
+    int a_index = kNoStreamIndex;
+    detail::CodecContextPtr adec;
+    detail::CodecContextPtr vdec;
+    AVFilterContext* vsrc = nullptr;            // non-owning; owned by Pipeline::graph_
+    AVFilterContext* asrc = nullptr;            // non-owning; owned by Pipeline::graph_
+    std::vector<detail::FramePtr> queued_v;     // decoded before the graph existed
+    std::vector<detail::FramePtr> queued_a;
+    std::vector<detail::PacketPtr> queued_pkts;  // audio packets read while priming for copy
 };
 
-// Does this decoder implement the given hardware device type?
-bool supports_device(const AVCodec* codec, AVHWDeviceType type) {
+[[nodiscard]] bool supports_device(const AVCodec* codec, AVHWDeviceType type) noexcept {
     for (int i = 0;; ++i) {
         const AVCodecHWConfig* config = avcodec_get_hw_config(codec, i);
-        if (!config) return false;
+        if (!config) {
+            return false;
+        }
         if (config->device_type == type &&
             (config->methods & AV_CODEC_HW_CONFIG_METHOD_HW_DEVICE_CTX)) {
             return true;
@@ -159,46 +157,48 @@ bool supports_device(const AVCodec* codec, AVHWDeviceType type) {
     }
 }
 
-// avcodec_find_decoder() returns whichever decoder for this codec id was
-// registered first, and that is not necessarily one that can use the GPU: with
-// no libdav1d in the build, AV1 resolves to libaom, a software-only decoder
-// several times slower than NVDEC. When a hardware device is in play, look for a
-// decoder that actually implements it before falling back to the default.
-const AVCodec* find_decoder(AVCodecID id, bool prefer_cuda) {
+// Prefers a decoder implementing CUDA HW device contexts when requested, since
+// avcodec_find_decoder() returns the first registered decoder (e.g. software
+// libaom for AV1) rather than a GPU-capable one.
+[[nodiscard]] const AVCodec* find_decoder(AVCodecID id, bool prefer_cuda) noexcept {
     if (prefer_cuda) {
         void* iter = nullptr;
         while (const AVCodec* codec = av_codec_iterate(&iter)) {
-            if (codec->id != id || !av_codec_is_decoder(codec)) continue;
-            if (supports_device(codec, AV_HWDEVICE_TYPE_CUDA)) return codec;
+            if (codec->id != id || !av_codec_is_decoder(codec)) {
+                continue;
+            }
+            if (supports_device(codec, AV_HWDEVICE_TYPE_CUDA)) {
+                return codec;
+            }
         }
     }
     return avcodec_find_decoder(id);
 }
 
-bool open_decoder(AVFormatContext* fmt, int index, AVBufferRef* hw_device,
-                  AVCodecContext** out) {
+[[nodiscard]] detail::CodecContextPtr open_decoder(const AVFormatContext* fmt,
+                                                   int index,
+                                                   AVBufferRef* hw_device) {
     const AVStream* st = fmt->streams[index];
     const AVCodec* dec = find_decoder(st->codecpar->codec_id, hw_device != nullptr);
     if (!dec) {
         BOOST_LOG_TRIVIAL(error) << "No decoder for stream " << index;
-        return false;
+        return nullptr;
     }
 
-    AVCodecContext* ctx = avcodec_alloc_context3(dec);
-    if (!ctx) return false;
+    detail::CodecContextPtr ctx{avcodec_alloc_context3(dec)};
+    if (!ctx) {
+        return nullptr;
+    }
 
-    int rc = avcodec_parameters_to_context(ctx, st->codecpar);
+    int rc = avcodec_parameters_to_context(ctx.get(), st->codecpar);
     if (rc < 0) {
         BOOST_LOG_TRIVIAL(error) << "Could not copy codec parameters: " << err_str(rc);
-        avcodec_free_context(&ctx);
-        return false;
+        return nullptr;
     }
-    // Makes decoded frames carry timestamps in the stream's time base.
     ctx->pkt_timebase = st->time_base;
 
-    // libavcodec defaults to a single thread; the ffmpeg CLI asks for automatic
-    // threading and so must we, or software decoding runs on one core.
-    ctx->thread_count = 0;
+    // Enable automatic multithreaded software decoding to match ffmpeg CLI behavior.
+    ctx->thread_count = kAutoThreadCount;
     ctx->thread_type = FF_THREAD_FRAME | FF_THREAD_SLICE;
 
     if (hw_device && st->codecpar->codec_type == AVMEDIA_TYPE_VIDEO) {
@@ -206,150 +206,152 @@ bool open_decoder(AVFormatContext* fmt, int index, AVBufferRef* hw_device,
         ctx->get_format = pick_cuda;
     }
 
-    rc = avcodec_open2(ctx, dec, nullptr);
+    rc = avcodec_open2(ctx.get(), dec, nullptr);
     if (rc < 0) {
         BOOST_LOG_TRIVIAL(error) << "Could not open decoder: " << err_str(rc);
-        avcodec_free_context(&ctx);
-        return false;
+        return nullptr;
     }
-    *out = ctx;
-    return true;
+    return ctx;
 }
 
-// Push one packet through a decoder, appending every frame it yields.
-bool decode_into(AVCodecContext* dec, const AVPacket* pkt, std::vector<FramePtr>& out) {
+// Pushes one packet through `dec`, appending every decoded frame to `out`.
+[[nodiscard]] bool decode_into(AVCodecContext* dec,
+                               const AVPacket* pkt,
+                               std::vector<detail::FramePtr>& out) {
     int rc = avcodec_send_packet(dec, pkt);
     if (rc < 0 && rc != AVERROR(EAGAIN) && rc != AVERROR_EOF) {
         BOOST_LOG_TRIVIAL(error) << "Decode failed: " << err_str(rc);
         return false;
     }
     for (;;) {
-        FramePtr frame = new_frame();
-        if (!frame) return false;
+        detail::FramePtr frame = detail::make_frame();
+        if (!frame) {
+            return false;
+        }
         rc = avcodec_receive_frame(dec, frame.get());
-        if (rc == AVERROR(EAGAIN) || rc == AVERROR_EOF) return true;
+        if (rc == AVERROR(EAGAIN) || rc == AVERROR_EOF) {
+            return true;
+        }
         if (rc < 0) {
             BOOST_LOG_TRIVIAL(error) << "Decode failed: " << err_str(rc);
             return false;
         }
-        FramePtr sw = to_software(std::move(frame));
-        if (!sw) return false;
+        detail::FramePtr sw = to_software(std::move(frame));
+        if (!sw) {
+            return false;
+        }
         out.push_back(std::move(sw));
     }
 }
 
-std::string format_hms(double seconds) {
-    if (seconds < 0) seconds = 0;
-    int total = static_cast<int>(seconds);
-    std::ostringstream oss;
-    oss << std::setfill('0') << std::setw(2) << (total / 3600) << ":"
-        << std::setfill('0') << std::setw(2) << ((total % 3600) / 60) << ":"
-        << std::setfill('0') << std::setw(2) << (total % 60);
-    return oss.str();
-}
-
-// --------------------------------------------------------------------------
-// The pipeline
-// --------------------------------------------------------------------------
-
 class Pipeline {
 public:
-    explicit Pipeline(const TranscodeRequest& req) : req_(req) {}
+    Pipeline(const TranscodeRequest& req, bool& created_output) noexcept
+        : req_(req), created_output_(created_output) {}
 
-    ~Pipeline() {
-        if (venc_) avcodec_free_context(&venc_);
-        if (aenc_) avcodec_free_context(&aenc_);
-        if (graph_) avfilter_graph_free(&graph_);
-        if (out_) {
-            if (out_->pb && !(out_->oformat->flags & AVFMT_NOFILE)) avio_closep(&out_->pb);
-            avformat_free_context(out_);
-        }
-        if (hw_device_) av_buffer_unref(&hw_device_);
-    }
+    Pipeline(const Pipeline&) = delete;
+    Pipeline& operator=(const Pipeline&) = delete;
 
-    bool run(ProgressReporter& reporter, double total_sec);
+    [[nodiscard]] bool run(ProgressReporter& reporter, double total_sec);
 
 private:
-    bool open_inputs();
-    bool prime_inputs();          // decode enough to learn each input's real formats
-    bool prime_one(Input& input);
-    bool build_graph();
-    bool open_encoders();
-    bool open_output();
-    bool feed_input(size_t index);
-    bool drain_graph();
-    bool encode_video(AVFrame* frame);
-    bool encode_audio(AVFrame* frame);
-    bool copy_audio_packet(const Input& in, AVPacket* pkt);
+    [[nodiscard]] bool open_inputs();
+    [[nodiscard]] bool prime_inputs();
+    [[nodiscard]] bool prime_one(Input& input);
+    [[nodiscard]] bool build_graph();
+    [[nodiscard]] bool open_encoders();
+    [[nodiscard]] bool open_output();
+    [[nodiscard]] bool push_frames(AVFilterContext* src, std::span<const detail::FramePtr> frames);
+    [[nodiscard]] bool feed_input(std::size_t index);
+    [[nodiscard]] bool drain_graph();
+    [[nodiscard]] bool encode_video(AVFrame* frame);
+    [[nodiscard]] bool encode_audio(AVFrame* frame);
+    [[nodiscard]] bool copy_audio_packet(const Input& in, AVPacket* pkt);
     void report(bool force);
 
     const TranscodeRequest& req_;
+    bool& created_output_;
     const bool audio_through_graph_ = !req_.audio_copy;
     ProgressReporter* reporter_ = nullptr;
     double total_sec_ = 0.0;
+
+    // Member order enforces safe reverse-dependency teardown (Rule of Zero):
+    // scratch buffers -> encoders -> filter graph -> output muxer -> inputs -> hw_device_.
+    detail::BufferRefPtr hw_device_;
     std::vector<std::unique_ptr<Input>> inputs_;
-    AVBufferRef* hw_device_ = nullptr;
 
-    AVFilterGraph* graph_ = nullptr;
-    AVFilterContext* vsink_ = nullptr;
-    AVFilterContext* asink_ = nullptr;
-
-    AVCodecContext* venc_ = nullptr;
-    AVCodecContext* aenc_ = nullptr;
-    const AVCodec* vcodec_ = nullptr;
-    const AVCodec* acodec_ = nullptr;
-
-    AVFormatContext* out_ = nullptr;
+    detail::FormatOutputPtr out_;
     AVStream* vstream_ = nullptr;
     AVStream* astream_ = nullptr;
 
-    int64_t video_frames_ = 0;
+    detail::FilterGraphPtr graph_;
+    AVFilterContext* vsink_ = nullptr;
+    AVFilterContext* asink_ = nullptr;
+
+    const AVCodec* vcodec_ = nullptr;
+    const AVCodec* acodec_ = nullptr;
+    detail::CodecContextPtr aenc_;
+    detail::CodecContextPtr venc_;
+
+    detail::FramePtr drain_frame_;
+    detail::PacketPtr encode_pkt_;
+
+    std::int64_t video_frames_ = 0;
     double out_sec_ = 0.0;
-    std::chrono::steady_clock::time_point started_;
-    std::chrono::steady_clock::time_point last_report_;
+    std::chrono::steady_clock::time_point started_{};
+    std::chrono::steady_clock::time_point last_report_{};
 };
 
 bool Pipeline::open_inputs() {
     if (req_.hwaccel_cuda) {
-        int rc = av_hwdevice_ctx_create(&hw_device_, AV_HWDEVICE_TYPE_CUDA, nullptr, nullptr, 0);
+        const int rc = av_hwdevice_ctx_create(
+            core::out_ptr(hw_device_), AV_HWDEVICE_TYPE_CUDA, nullptr, nullptr, 0);
         if (rc < 0) {
             BOOST_LOG_TRIVIAL(warning) << "CUDA device unavailable, decoding in software: "
                                        << err_str(rc);
-            hw_device_ = nullptr;
+            hw_device_.reset();
         }
     }
 
+    inputs_.reserve(req_.inputs.size());
     for (const auto& path : req_.inputs) {
         auto in = std::make_unique<Input>();
+        const std::string path_str = path.string();
 
-        int rc = avformat_open_input(&in->fmt, path.string().c_str(), nullptr, nullptr);
+        int rc = avformat_open_input(core::out_ptr(in->fmt), path_str.c_str(), nullptr, nullptr);
         if (rc < 0) {
             BOOST_LOG_TRIVIAL(error) << "Could not open " << path << ": " << err_str(rc);
             return false;
         }
-        rc = avformat_find_stream_info(in->fmt, nullptr);
+        rc = avformat_find_stream_info(in->fmt.get(), nullptr);
         if (rc < 0) {
             BOOST_LOG_TRIVIAL(error) << "No stream info in " << path << ": " << err_str(rc);
             return false;
         }
 
-        in->v_index = av_find_best_stream(in->fmt, AVMEDIA_TYPE_VIDEO, -1, -1, nullptr, 0);
-        in->a_index = av_find_best_stream(in->fmt, AVMEDIA_TYPE_AUDIO, -1, -1, nullptr, 0);
+        in->v_index = av_find_best_stream(
+            in->fmt.get(), AVMEDIA_TYPE_VIDEO, kAutoStreamIndex, kAutoStreamIndex, nullptr, 0);
+        in->a_index = av_find_best_stream(
+            in->fmt.get(), AVMEDIA_TYPE_AUDIO, kAutoStreamIndex, kAutoStreamIndex, nullptr, 0);
         if (in->v_index < 0) {
             BOOST_LOG_TRIVIAL(error) << path << " has no video stream.";
             return false;
         }
         if (in->a_index < 0 && audio_through_graph_) {
-            BOOST_LOG_TRIVIAL(error) << path
-                << " has no audio stream, which the requested filter graph needs.";
+            BOOST_LOG_TRIVIAL(error)
+                << path << " has no audio stream, which the requested filter graph needs.";
             return false;
         }
 
-        if (!open_decoder(in->fmt, in->v_index, hw_device_, &in->vdec)) return false;
-        // Copied audio is never decoded, so it needs no decoder.
-        if (in->a_index >= 0 && audio_through_graph_ &&
-            !open_decoder(in->fmt, in->a_index, nullptr, &in->adec)) {
+        in->vdec = open_decoder(in->fmt.get(), in->v_index, hw_device_.get());
+        if (!in->vdec) {
             return false;
+        }
+        if (in->a_index >= 0 && audio_through_graph_) {
+            in->adec = open_decoder(in->fmt.get(), in->a_index, nullptr);
+            if (!in->adec) {
+                return false;
+            }
         }
 
         inputs_.push_back(std::move(in));
@@ -359,139 +361,197 @@ bool Pipeline::open_inputs() {
 
 bool Pipeline::prime_inputs() {
     for (auto& in : inputs_) {
-        if (prime_one(*in)) continue;
-        if (!hw_device_) return false;
+        if (prime_one(*in)) {
+            continue;
+        }
+        if (!hw_device_) {
+            return false;
+        }
 
-        // The decoder chosen for the GPU may be hardware-only (the native AV1
-        // decoder is), so a stream NVDEC cannot handle fails outright rather than
-        // falling back on its own. Reopen this input in software and try once more.
-        BOOST_LOG_TRIVIAL(warning) << "GPU decoding did not work for this input; "
-                                      "falling back to software for it.";
-        avcodec_free_context(&in->vdec);
-        if (!open_decoder(in->fmt, in->v_index, nullptr, &in->vdec)) return false;
+        // Hardware-only decoders fail outright on unsupported profiles rather
+        // than falling back automatically; reopen this input in software.
+        BOOST_LOG_TRIVIAL(warning)
+            << "GPU decoding did not work for this input; falling back to software for it.";
+        in->vdec.reset();
+        in->vdec = open_decoder(in->fmt.get(), in->v_index, nullptr);
+        if (!in->vdec) {
+            return false;
+        }
         if (in->adec) {
-            avcodec_free_context(&in->adec);
-            if (!open_decoder(in->fmt, in->a_index, nullptr, &in->adec)) return false;
+            in->adec.reset();
+            in->adec = open_decoder(in->fmt.get(), in->a_index, nullptr);
+            if (!in->adec) {
+                return false;
+            }
         }
         in->queued_v.clear();
         in->queued_a.clear();
         in->queued_pkts.clear();
-        if (avformat_seek_file(in->fmt, -1, INT64_MIN, 0, INT64_MAX, 0) < 0) return false;
+        if (avformat_seek_file(in->fmt.get(),
+                               kAutoStreamIndex,
+                               std::numeric_limits<std::int64_t>::min(),
+                               0,
+                               std::numeric_limits<std::int64_t>::max(),
+                               0) < 0) {
+            return false;
+        }
 
-        if (!prime_one(*in)) return false;
+        if (!prime_one(*in)) {
+            return false;
+        }
     }
     return true;
 }
 
 bool Pipeline::prime_one(Input& input) {
-    // The filter graph's buffer sources must be created with each input's real
-    // frame format, and hardware decoding only reveals it once a frame comes
-    // back (NVDEC hands back NV12 where the software path gives YUV420P). So
-    // decode one frame of each kind up front and keep it for later.
-    {
-        Input* in = &input;
-        PacketPtr pkt = new_packet();
-        if (!pkt) return false;
+    // Buffer sources require each input's true decoded frame format, which
+    // hardware decoding reveals only after delivering a frame (e.g. NV12 vs
+    // YUV420P). Decode one frame per active stream up front and queue it.
+    detail::PacketPtr pkt = detail::make_packet();
+    if (!pkt) {
+        return false;
+    }
 
-        while (in->queued_v.empty() || (audio_through_graph_ && in->queued_a.empty())) {
-            int rc = av_read_frame(in->fmt, pkt.get());
-            if (rc == AVERROR_EOF) break;
-            if (rc < 0) {
-                BOOST_LOG_TRIVIAL(error) << "Read failed while priming: " << err_str(rc);
-                return false;
-            }
-            bool ok = true;
-            if (pkt->stream_index == in->v_index) {
-                ok = decode_into(in->vdec, pkt.get(), in->queued_v);
-            } else if (in->adec && pkt->stream_index == in->a_index) {
-                ok = decode_into(in->adec, pkt.get(), in->queued_a);
-            } else if (pkt->stream_index == in->a_index) {
-                in->queued_pkts.push_back(std::move(pkt));  // copied straight through later
-                pkt = new_packet();
-                if (!pkt) return false;
-                continue;
-            }
-            av_packet_unref(pkt.get());
-            if (!ok) return false;
+    while (input.queued_v.empty() || (audio_through_graph_ && input.queued_a.empty())) {
+        const int rc = av_read_frame(input.fmt.get(), pkt.get());
+        if (rc == AVERROR_EOF) {
+            break;
         }
-
-        if (in->queued_v.empty() || (audio_through_graph_ && in->queued_a.empty())) {
-            BOOST_LOG_TRIVIAL(error) << "Could not decode a first frame of every stream; "
-                                        "the input may be truncated.";
+        if (rc < 0) {
+            BOOST_LOG_TRIVIAL(error) << "Read failed while priming: " << err_str(rc);
             return false;
         }
+
+        bool ok = true;
+        if (pkt->stream_index == input.v_index) {
+            ok = decode_into(input.vdec.get(), pkt.get(), input.queued_v);
+        } else if (input.adec && pkt->stream_index == input.a_index) {
+            ok = decode_into(input.adec.get(), pkt.get(), input.queued_a);
+        } else if (pkt->stream_index == input.a_index) {
+            input.queued_pkts.push_back(std::move(pkt));
+            pkt = detail::make_packet();
+            if (!pkt) {
+                return false;
+            }
+            continue;
+        }
+        av_packet_unref(pkt.get());
+        if (!ok) {
+            return false;
+        }
+    }
+
+    if (input.queued_v.empty() || (audio_through_graph_ && input.queued_a.empty())) {
+        BOOST_LOG_TRIVIAL(error)
+            << "Could not decode a first frame of every stream; the input may be truncated.";
+        return false;
     }
     return true;
 }
 
 bool Pipeline::build_graph() {
-    graph_ = avfilter_graph_alloc();
-    if (!graph_) return false;
+    graph_.reset(avfilter_graph_alloc());
+    if (!graph_) {
+        return false;
+    }
 
-    // Buffer sources, described by the frames primed above.
-    for (size_t i = 0; i < inputs_.size(); ++i) {
+    for (const std::size_t i : std::views::iota(std::size_t{0}, inputs_.size())) {
         Input& in = *inputs_[i];
         const AVFrame* vf = in.queued_v.front().get();
         const AVStream* vst = in.fmt->streams[in.v_index];
 
         AVRational sar = vf->sample_aspect_ratio;
-        if (sar.num <= 0 || sar.den <= 0) sar = AVRational{1, 1};
+        if (sar.num <= 0 || sar.den <= 0) {
+            sar = kDefaultSar;
+        }
         AVRational rate = vst->avg_frame_rate;
-        if (rate.num <= 0 || rate.den <= 0) rate = vst->r_frame_rate;
+        if (rate.num <= 0 || rate.den <= 0) {
+            rate = vst->r_frame_rate;
+        }
 
-        char args[512];
-        std::snprintf(args, sizeof(args),
-                      "video_size=%dx%d:pix_fmt=%d:time_base=%d/%d:pixel_aspect=%d/%d:frame_rate=%d/%d",
-                      vf->width, vf->height, vf->format,
-                      vst->time_base.num, vst->time_base.den,
-                      sar.num, sar.den, rate.num, rate.den);
+        const std::string vargs = std::format(
+            "video_size={}x{}:pix_fmt={}:time_base={}/{}:pixel_aspect={}/{}:frame_rate={}/{}",
+            vf->width, vf->height, vf->format,
+            vst->time_base.num, vst->time_base.den,
+            sar.num, sar.den,
+            rate.num, rate.den);
+        const std::string vname = std::format("in{}v", i);
 
-        std::string vname = "in" + std::to_string(i) + "v";
-        int rc = avfilter_graph_create_filter(&in.vsrc, avfilter_get_by_name("buffer"),
-                                              vname.c_str(), args, nullptr, graph_);
+        int rc = avfilter_graph_create_filter(&in.vsrc,
+                                              avfilter_get_by_name("buffer"),
+                                              vname.c_str(),
+                                              vargs.c_str(),
+                                              nullptr,
+                                              graph_.get());
         if (rc < 0) {
             BOOST_LOG_TRIVIAL(error) << "Could not create " << vname << ": " << err_str(rc);
             return false;
         }
 
-        if (!audio_through_graph_) continue;
+        if (!audio_through_graph_) {
+            continue;
+        }
 
         const AVFrame* af = in.queued_a.front().get();
         const AVStream* ast = in.fmt->streams[in.a_index];
 
-        char layout[128];
-        av_channel_layout_describe(&af->ch_layout, layout, sizeof(layout));
-        char aargs[512];
-        std::snprintf(aargs, sizeof(aargs),
-                      "time_base=%d/%d:sample_rate=%d:sample_fmt=%s:channel_layout=%s",
-                      ast->time_base.num, ast->time_base.den, af->sample_rate,
-                      av_get_sample_fmt_name(static_cast<AVSampleFormat>(af->format)), layout);
+        std::array<char, kChannelLayoutBufSize> layout{};
+        av_channel_layout_describe(&af->ch_layout, layout.data(), layout.size());
+        const char* sample_fmt_name =
+            av_get_sample_fmt_name(static_cast<AVSampleFormat>(af->format));
+        const std::string aargs = std::format(
+            "time_base={}/{}:sample_rate={}:sample_fmt={}:channel_layout={}",
+            ast->time_base.num, ast->time_base.den,
+            af->sample_rate,
+            std::string_view{sample_fmt_name ? sample_fmt_name : "none"},
+            std::string_view{layout.data()});
+        const std::string aname = std::format("in{}a", i);
 
-        std::string aname = "in" + std::to_string(i) + "a";
-        rc = avfilter_graph_create_filter(&in.asrc, avfilter_get_by_name("abuffer"),
-                                          aname.c_str(), aargs, nullptr, graph_);
+        rc = avfilter_graph_create_filter(&in.asrc,
+                                          avfilter_get_by_name("abuffer"),
+                                          aname.c_str(),
+                                          aargs.c_str(),
+                                          nullptr,
+                                          graph_.get());
         if (rc < 0) {
             BOOST_LOG_TRIVIAL(error) << "Could not create " << aname << ": " << err_str(rc);
             return false;
         }
     }
 
-    int rc = avfilter_graph_create_filter(&vsink_, avfilter_get_by_name("buffersink"),
-                                          "outv", nullptr, nullptr, graph_);
-    if (rc < 0) return false;
+    int rc = avfilter_graph_create_filter(&vsink_,
+                                          avfilter_get_by_name("buffersink"),
+                                          "outv",
+                                          nullptr,
+                                          nullptr,
+                                          graph_.get());
+    if (rc < 0) {
+        return false;
+    }
     if (audio_through_graph_) {
-        rc = avfilter_graph_create_filter(&asink_, avfilter_get_by_name("abuffersink"),
-                                          "outa", nullptr, nullptr, graph_);
-        if (rc < 0) return false;
+        rc = avfilter_graph_create_filter(&asink_,
+                                          avfilter_get_by_name("abuffersink"),
+                                          "outa",
+                                          nullptr,
+                                          nullptr,
+                                          graph_.get());
+        if (rc < 0) {
+            return false;
+        }
     }
 
-    // Constrain the sinks to what the chosen encoders accept, so the graph
-    // inserts the needed scale/aresample conversions itself.
+    // Constrain sinks to formats accepted by the selected encoders so the graph
+    // inserts scale/aresample conversions automatically.
     auto pix_fmts = supported<AVPixelFormat>(vcodec_, AV_CODEC_CONFIG_PIX_FORMAT);
-    if (pix_fmts.empty()) pix_fmts.push_back(AV_PIX_FMT_YUV420P);
+    if (pix_fmts.empty()) {
+        pix_fmts.push_back(AV_PIX_FMT_YUV420P);
+    }
+    const auto pix_fmts_bytes = static_cast<int>(pix_fmts.size() * sizeof(AVPixelFormat));
     pix_fmts.push_back(AV_PIX_FMT_NONE);
-    rc = av_opt_set_bin(vsink_, "pix_fmts", reinterpret_cast<const uint8_t*>(pix_fmts.data()),
-                        static_cast<int>((pix_fmts.size() - 1) * sizeof(AVPixelFormat)),
+    rc = av_opt_set_bin(vsink_,
+                        "pix_fmts",
+                        reinterpret_cast<const std::uint8_t*>(pix_fmts.data()),
+                        pix_fmts_bytes,
                         AV_OPT_SEARCH_CHILDREN);
     if (rc < 0) {
         BOOST_LOG_TRIVIAL(error) << "Could not constrain video sink: " << err_str(rc);
@@ -500,11 +560,15 @@ bool Pipeline::build_graph() {
 
     if (asink_) {
         auto sample_fmts = supported<AVSampleFormat>(acodec_, AV_CODEC_CONFIG_SAMPLE_FORMAT);
-        if (sample_fmts.empty()) sample_fmts.push_back(AV_SAMPLE_FMT_FLTP);
+        if (sample_fmts.empty()) {
+            sample_fmts.push_back(AV_SAMPLE_FMT_FLTP);
+        }
+        const auto sample_fmts_bytes = static_cast<int>(sample_fmts.size() * sizeof(AVSampleFormat));
         sample_fmts.push_back(AV_SAMPLE_FMT_NONE);
-        rc = av_opt_set_bin(asink_, "sample_fmts",
-                            reinterpret_cast<const uint8_t*>(sample_fmts.data()),
-                            static_cast<int>((sample_fmts.size() - 1) * sizeof(AVSampleFormat)),
+        rc = av_opt_set_bin(asink_,
+                            "sample_fmts",
+                            reinterpret_cast<const std::uint8_t*>(sample_fmts.data()),
+                            sample_fmts_bytes,
                             AV_OPT_SEARCH_CHILDREN);
         if (rc < 0) {
             BOOST_LOG_TRIVIAL(error) << "Could not constrain audio sink: " << err_str(rc);
@@ -512,56 +576,64 @@ bool Pipeline::build_graph() {
         }
     }
 
-    // Parse the requested chain, then wire our sources and sinks onto the pads it
-    // left open. Matching by label keeps this independent of pad ordering.
-    AVFilterInOut* parsed_inputs = nullptr;
-    AVFilterInOut* parsed_outputs = nullptr;
-    rc = avfilter_graph_parse2(graph_, req_.filter_description.c_str(),
-                               &parsed_inputs, &parsed_outputs);
+    // Parse the filter chain and bind open pads by label so wiring is
+    // independent of pad ordering.
+    detail::FilterInOutPtr parsed_inputs;
+    detail::FilterInOutPtr parsed_outputs;
+    rc = avfilter_graph_parse2(graph_.get(),
+                               req_.filter_description.c_str(),
+                               core::out_ptr(parsed_inputs),
+                               core::out_ptr(parsed_outputs));
     if (rc < 0) {
         BOOST_LOG_TRIVIAL(error) << "Could not parse filter graph \""
                                  << req_.filter_description << "\": " << err_str(rc);
         return false;
     }
 
-    bool ok = true;
-    for (AVFilterInOut* cur = parsed_inputs; cur && ok; cur = cur->next) {
+    for (AVFilterInOut* cur = parsed_inputs.get(); cur; cur = cur->next) {
+        const std::string_view pad_name = cur->name ? std::string_view{cur->name} : std::string_view{};
         AVFilterContext* src = nullptr;
-        for (size_t i = 0; i < inputs_.size() && !src; ++i) {
-            if (cur->name == std::string("in" + std::to_string(i) + "v")) src = inputs_[i]->vsrc;
-            if (cur->name == std::string("in" + std::to_string(i) + "a")) src = inputs_[i]->asrc;
+        for (const std::size_t i : std::views::iota(std::size_t{0}, inputs_.size())) {
+            if (pad_name == std::format("in{}v", i)) {
+                src = inputs_[i]->vsrc;
+                break;
+            }
+            if (pad_name == std::format("in{}a", i)) {
+                src = inputs_[i]->asrc;
+                break;
+            }
         }
         if (!src) {
-            BOOST_LOG_TRIVIAL(error) << "Filter graph asks for unknown input [" << cur->name << "]";
-            ok = false;
-            break;
+            BOOST_LOG_TRIVIAL(error) << "Filter graph asks for unknown input [" << pad_name << "]";
+            return false;
         }
-        rc = avfilter_link(src, 0, cur->filter_ctx, cur->pad_idx);
+        rc = avfilter_link(src, kPrimaryPadIndex, cur->filter_ctx, static_cast<unsigned>(cur->pad_idx));
         if (rc < 0) {
-            BOOST_LOG_TRIVIAL(error) << "Could not link [" << cur->name << "]: " << err_str(rc);
-            ok = false;
+            BOOST_LOG_TRIVIAL(error) << "Could not link [" << pad_name << "]: " << err_str(rc);
+            return false;
         }
     }
-    for (AVFilterInOut* cur = parsed_outputs; cur && ok; cur = cur->next) {
-        AVFilterContext* sink = nullptr;
-        if (cur->name == std::string("outv")) sink = vsink_;
-        else if (cur->name == std::string("outa")) sink = asink_;
-        if (!sink) {
-            BOOST_LOG_TRIVIAL(error) << "Filter graph produces unknown output [" << cur->name << "]";
-            ok = false;
-            break;
-        }
-        rc = avfilter_link(cur->filter_ctx, cur->pad_idx, sink, 0);
-        if (rc < 0) {
-            BOOST_LOG_TRIVIAL(error) << "Could not link [" << cur->name << "]: " << err_str(rc);
-            ok = false;
-        }
-    }
-    avfilter_inout_free(&parsed_inputs);
-    avfilter_inout_free(&parsed_outputs);
-    if (!ok) return false;
 
-    rc = avfilter_graph_config(graph_, nullptr);
+    for (AVFilterInOut* cur = parsed_outputs.get(); cur; cur = cur->next) {
+        const std::string_view pad_name = cur->name ? std::string_view{cur->name} : std::string_view{};
+        AVFilterContext* sink = nullptr;
+        if (pad_name == kVideoOutPad) {
+            sink = vsink_;
+        } else if (pad_name == kAudioOutPad) {
+            sink = asink_;
+        }
+        if (!sink) {
+            BOOST_LOG_TRIVIAL(error) << "Filter graph produces unknown output [" << pad_name << "]";
+            return false;
+        }
+        rc = avfilter_link(cur->filter_ctx, static_cast<unsigned>(cur->pad_idx), sink, kPrimaryPadIndex);
+        if (rc < 0) {
+            BOOST_LOG_TRIVIAL(error) << "Could not link [" << pad_name << "]: " << err_str(rc);
+            return false;
+        }
+    }
+
+    rc = avfilter_graph_config(graph_.get(), nullptr);
     if (rc < 0) {
         BOOST_LOG_TRIVIAL(error) << "Filter graph is not configurable: " << err_str(rc);
         return false;
@@ -570,62 +642,69 @@ bool Pipeline::build_graph() {
 }
 
 bool Pipeline::open_encoders() {
-    venc_ = avcodec_alloc_context3(vcodec_);
-    if (!venc_) return false;
+    venc_.reset(avcodec_alloc_context3(vcodec_));
+    if (!venc_) {
+        return false;
+    }
 
-    venc_->width               = av_buffersink_get_w(vsink_);
-    venc_->height              = av_buffersink_get_h(vsink_);
-    venc_->pix_fmt             = static_cast<AVPixelFormat>(av_buffersink_get_format(vsink_));
-    venc_->time_base           = av_buffersink_get_time_base(vsink_);
-    venc_->framerate           = av_buffersink_get_frame_rate(vsink_);
+    venc_->width = av_buffersink_get_w(vsink_);
+    venc_->height = av_buffersink_get_h(vsink_);
+    venc_->pix_fmt = static_cast<AVPixelFormat>(av_buffersink_get_format(vsink_));
+    venc_->time_base = av_buffersink_get_time_base(vsink_);
+    venc_->framerate = av_buffersink_get_frame_rate(vsink_);
     venc_->sample_aspect_ratio = av_buffersink_get_sample_aspect_ratio(vsink_);
-    venc_->bit_rate            = req_.video_bit_rate;
-    venc_->thread_count        = 0;   // automatic, as above
+    venc_->bit_rate = req_.video_bit_rate;
+    venc_->thread_count = kAutoThreadCount;
 
-    if (!audio_through_graph_) return true;   // copied audio needs no encoder
+    if (!audio_through_graph_) {
+        return true;
+    }
 
-    aenc_ = avcodec_alloc_context3(acodec_);
-    if (!aenc_) return false;
+    aenc_.reset(avcodec_alloc_context3(acodec_));
+    if (!aenc_) {
+        return false;
+    }
 
     aenc_->sample_rate = av_buffersink_get_sample_rate(asink_);
-    aenc_->sample_fmt  = static_cast<AVSampleFormat>(av_buffersink_get_format(asink_));
-    aenc_->bit_rate    = req_.audio_bit_rate;
-    aenc_->time_base   = AVRational{1, aenc_->sample_rate};
-    int rc = av_buffersink_get_ch_layout(asink_, &aenc_->ch_layout);
+    aenc_->sample_fmt = static_cast<AVSampleFormat>(av_buffersink_get_format(asink_));
+    aenc_->bit_rate = req_.audio_bit_rate;
+    aenc_->time_base = AVRational{1, aenc_->sample_rate};
+    const int rc = av_buffersink_get_ch_layout(asink_, &aenc_->ch_layout);
     if (rc < 0) {
         BOOST_LOG_TRIVIAL(error) << "Could not read the audio layout: " << err_str(rc);
         return false;
     }
-
     return true;
 }
 
 bool Pipeline::open_output() {
-    int rc = avformat_alloc_output_context2(&out_, nullptr, nullptr, req_.output.string().c_str());
+    const std::string out_path_str = req_.output.string();
+    int rc = avformat_alloc_output_context2(
+        core::out_ptr(out_), nullptr, nullptr, out_path_str.c_str());
     if (rc < 0 || !out_) {
         BOOST_LOG_TRIVIAL(error) << "Could not create the output container: " << err_str(rc);
         return false;
     }
 
-    // mp4 keeps codec extradata in the container header, so the encoders must be
-    // told to emit it globally rather than in-band.
+    // Containers like MP4 store codec extradata in the global header rather than in-band.
     if (out_->oformat->flags & AVFMT_GLOBALHEADER) {
         venc_->flags |= AV_CODEC_FLAG_GLOBAL_HEADER;
-        if (aenc_) aenc_->flags |= AV_CODEC_FLAG_GLOBAL_HEADER;
+        if (aenc_) {
+            aenc_->flags |= AV_CODEC_FLAG_GLOBAL_HEADER;
+        }
     }
 
-    AVDictionary* vopts = nullptr;
-    for (const auto& kv : req_.video_options) {
-        av_dict_set(&vopts, kv.first.c_str(), kv.second.c_str(), 0);
+    detail::DictionaryPtr vopts;
+    for (const auto& [key, val] : req_.video_options) {
+        av_dict_set(core::inout_ptr(vopts), key.c_str(), val.c_str(), 0);
     }
-    rc = avcodec_open2(venc_, vcodec_, &vopts);
-    int leftover = av_dict_count(vopts);
-    if (leftover > 0) {
-        const AVDictionaryEntry* e = av_dict_get(vopts, "", nullptr, AV_DICT_IGNORE_SUFFIX);
+    rc = avcodec_open2(venc_.get(), vcodec_, core::inout_ptr(vopts));
+    if (av_dict_count(vopts.get()) > 0) {
+        const AVDictionaryEntry* e =
+            av_dict_get(vopts.get(), "", nullptr, AV_DICT_IGNORE_SUFFIX);
         BOOST_LOG_TRIVIAL(warning) << "Encoder " << req_.video_encoder
                                    << " ignored option '" << (e ? e->key : "?") << "'.";
     }
-    av_dict_free(&vopts);
     if (rc < 0) {
         BOOST_LOG_TRIVIAL(error) << "Could not open encoder " << req_.video_encoder
                                  << ": " << err_str(rc);
@@ -633,51 +712,59 @@ bool Pipeline::open_output() {
     }
 
     if (aenc_) {
-        rc = avcodec_open2(aenc_, acodec_, nullptr);
+        rc = avcodec_open2(aenc_.get(), acodec_, nullptr);
         if (rc < 0) {
             BOOST_LOG_TRIVIAL(error) << "Could not open encoder " << req_.audio_encoder
                                      << ": " << err_str(rc);
             return false;
         }
 
-        // AAC consumes a fixed number of samples per call; let the sink hand out
-        // exactly that many so no separate sample FIFO is needed.
+        // Let the audio sink emit exact encoder frame sizes (e.g. 1024 for AAC).
         if (aenc_->frame_size > 0) {
             av_buffersink_set_frame_size(asink_, aenc_->frame_size);
         }
     }
 
-    vstream_ = avformat_new_stream(out_, nullptr);
-    if (!vstream_) return false;
-    rc = avcodec_parameters_from_context(vstream_->codecpar, venc_);
-    if (rc < 0) return false;
+    vstream_ = avformat_new_stream(out_.get(), nullptr);
+    if (!vstream_) {
+        return false;
+    }
+    rc = avcodec_parameters_from_context(vstream_->codecpar, venc_.get());
+    if (rc < 0) {
+        return false;
+    }
     vstream_->time_base = venc_->time_base;
 
     const bool copy_audio = !audio_through_graph_ && inputs_[0]->a_index >= 0;
     if (aenc_ || copy_audio) {
-        astream_ = avformat_new_stream(out_, nullptr);
-        if (!astream_) return false;
+        astream_ = avformat_new_stream(out_.get(), nullptr);
+        if (!astream_) {
+            return false;
+        }
         if (aenc_) {
-            rc = avcodec_parameters_from_context(astream_->codecpar, aenc_);
+            rc = avcodec_parameters_from_context(astream_->codecpar, aenc_.get());
             astream_->time_base = aenc_->time_base;
         } else {
             const AVStream* src = inputs_[0]->fmt->streams[inputs_[0]->a_index];
             rc = avcodec_parameters_copy(astream_->codecpar, src->codecpar);
-            astream_->codecpar->codec_tag = 0;   // let the muxer choose its own tag
+            astream_->codecpar->codec_tag = 0;  // let the muxer choose its own tag
             astream_->time_base = src->time_base;
         }
-        if (rc < 0) return false;
-    }
-
-    if (!(out_->oformat->flags & AVFMT_NOFILE)) {
-        rc = avio_open(&out_->pb, req_.output.string().c_str(), AVIO_FLAG_WRITE);
         if (rc < 0) {
-            BOOST_LOG_TRIVIAL(error) << "Could not create " << req_.output << ": " << err_str(rc);
             return false;
         }
     }
 
-    rc = avformat_write_header(out_, nullptr);
+    if (!(out_->oformat->flags & AVFMT_NOFILE)) {
+        rc = avio_open(&out_->pb, out_path_str.c_str(), AVIO_FLAG_WRITE);
+        if (rc < 0) {
+            BOOST_LOG_TRIVIAL(error) << "Could not create " << req_.output << ": " << err_str(rc);
+            return false;
+        }
+        created_output_ = true;
+    }
+
+    rc = avformat_write_header(out_.get(), nullptr);
     if (rc < 0) {
         BOOST_LOG_TRIVIAL(error) << "Could not write the container header: " << err_str(rc);
         return false;
@@ -690,27 +777,28 @@ bool Pipeline::encode_video(AVFrame* frame) {
         frame->pts = av_rescale_q(frame->pts, av_buffersink_get_time_base(vsink_), venc_->time_base);
         frame->pict_type = AV_PICTURE_TYPE_NONE;
     }
-    int rc = avcodec_send_frame(venc_, frame);
+    int rc = avcodec_send_frame(venc_.get(), frame);
     if (rc < 0) {
         BOOST_LOG_TRIVIAL(error) << "Video encode failed: " << err_str(rc);
         return false;
     }
-    PacketPtr pkt = new_packet();
-    if (!pkt) return false;
+
     for (;;) {
-        rc = avcodec_receive_packet(venc_, pkt.get());
-        if (rc == AVERROR(EAGAIN) || rc == AVERROR_EOF) return true;
+        rc = avcodec_receive_packet(venc_.get(), encode_pkt_.get());
+        if (rc == AVERROR(EAGAIN) || rc == AVERROR_EOF) {
+            return true;
+        }
         if (rc < 0) {
             BOOST_LOG_TRIVIAL(error) << "Video encode failed: " << err_str(rc);
             return false;
         }
-        pkt->stream_index = vstream_->index;
-        av_packet_rescale_ts(pkt.get(), venc_->time_base, vstream_->time_base);
-        if (pkt->pts != AV_NOPTS_VALUE) {
-            out_sec_ = pkt->pts * av_q2d(vstream_->time_base);
+        encode_pkt_->stream_index = vstream_->index;
+        av_packet_rescale_ts(encode_pkt_.get(), venc_->time_base, vstream_->time_base);
+        if (encode_pkt_->pts != AV_NOPTS_VALUE) {
+            out_sec_ = encode_pkt_->pts * av_q2d(vstream_->time_base);
         }
-        rc = av_interleaved_write_frame(out_, pkt.get());
-        av_packet_unref(pkt.get());
+        rc = av_interleaved_write_frame(out_.get(), encode_pkt_.get());
+        av_packet_unref(encode_pkt_.get());
         if (rc < 0) {
             BOOST_LOG_TRIVIAL(error) << "Could not write a video packet: " << err_str(rc);
             return false;
@@ -723,24 +811,25 @@ bool Pipeline::encode_audio(AVFrame* frame) {
     if (frame) {
         frame->pts = av_rescale_q(frame->pts, av_buffersink_get_time_base(asink_), aenc_->time_base);
     }
-    int rc = avcodec_send_frame(aenc_, frame);
+    int rc = avcodec_send_frame(aenc_.get(), frame);
     if (rc < 0) {
         BOOST_LOG_TRIVIAL(error) << "Audio encode failed: " << err_str(rc);
         return false;
     }
-    PacketPtr pkt = new_packet();
-    if (!pkt) return false;
+
     for (;;) {
-        rc = avcodec_receive_packet(aenc_, pkt.get());
-        if (rc == AVERROR(EAGAIN) || rc == AVERROR_EOF) return true;
+        rc = avcodec_receive_packet(aenc_.get(), encode_pkt_.get());
+        if (rc == AVERROR(EAGAIN) || rc == AVERROR_EOF) {
+            return true;
+        }
         if (rc < 0) {
             BOOST_LOG_TRIVIAL(error) << "Audio encode failed: " << err_str(rc);
             return false;
         }
-        pkt->stream_index = astream_->index;
-        av_packet_rescale_ts(pkt.get(), aenc_->time_base, astream_->time_base);
-        rc = av_interleaved_write_frame(out_, pkt.get());
-        av_packet_unref(pkt.get());
+        encode_pkt_->stream_index = astream_->index;
+        av_packet_rescale_ts(encode_pkt_.get(), aenc_->time_base, astream_->time_base);
+        rc = av_interleaved_write_frame(out_.get(), encode_pkt_.get());
+        av_packet_unref(encode_pkt_.get());
         if (rc < 0) {
             BOOST_LOG_TRIVIAL(error) << "Could not write an audio packet: " << err_str(rc);
             return false;
@@ -749,14 +838,16 @@ bool Pipeline::encode_audio(AVFrame* frame) {
 }
 
 bool Pipeline::copy_audio_packet(const Input& in, AVPacket* pkt) {
-    if (!astream_) return true;   // the output has no audio track
+    if (!astream_) {
+        return true;  // source has no audio track
+    }
 
     const AVStream* src = in.fmt->streams[in.a_index];
     pkt->stream_index = astream_->index;
     av_packet_rescale_ts(pkt, src->time_base, astream_->time_base);
-    pkt->pos = -1;
+    pkt->pos = kUnknownPacketPos;
 
-    int rc = av_interleaved_write_frame(out_, pkt);
+    const int rc = av_interleaved_write_frame(out_.get(), pkt);
     if (rc < 0) {
         BOOST_LOG_TRIVIAL(error) << "Could not write a copied audio packet: " << err_str(rc);
         return false;
@@ -765,64 +856,80 @@ bool Pipeline::copy_audio_packet(const Input& in, AVPacket* pkt) {
 }
 
 bool Pipeline::drain_graph() {
-    FramePtr frame = new_frame();
-    if (!frame) return false;
-
     for (;;) {
-        int rc = av_buffersink_get_frame(vsink_, frame.get());
-        if (rc == AVERROR(EAGAIN) || rc == AVERROR_EOF) break;
+        const int rc = av_buffersink_get_frame(vsink_, drain_frame_.get());
+        if (rc == AVERROR(EAGAIN) || rc == AVERROR_EOF) {
+            break;
+        }
         if (rc < 0) {
             BOOST_LOG_TRIVIAL(error) << "Filter graph failed: " << err_str(rc);
             return false;
         }
-        bool ok = encode_video(frame.get());
-        av_frame_unref(frame.get());
-        if (!ok) return false;
+        const bool ok = encode_video(drain_frame_.get());
+        av_frame_unref(drain_frame_.get());
+        if (!ok) {
+            return false;
+        }
     }
     while (asink_) {
-        int rc = av_buffersink_get_frame(asink_, frame.get());
-        if (rc == AVERROR(EAGAIN) || rc == AVERROR_EOF) break;
+        const int rc = av_buffersink_get_frame(asink_, drain_frame_.get());
+        if (rc == AVERROR(EAGAIN) || rc == AVERROR_EOF) {
+            break;
+        }
         if (rc < 0) {
             BOOST_LOG_TRIVIAL(error) << "Filter graph failed: " << err_str(rc);
             return false;
         }
-        bool ok = encode_audio(frame.get());
-        av_frame_unref(frame.get());
-        if (!ok) return false;
+        const bool ok = encode_audio(drain_frame_.get());
+        av_frame_unref(drain_frame_.get());
+        if (!ok) {
+            return false;
+        }
     }
 
-    // Drain runs constantly while feeding, so this is where progress advances;
-    // report() throttles itself so a long file still updates smoothly.
     report(false);
     return true;
 }
 
-bool Pipeline::feed_input(size_t index) {
+bool Pipeline::push_frames(AVFilterContext* src, std::span<const detail::FramePtr> frames) {
+    if (frames.empty()) {
+        return true;
+    }
+    return std::ranges::all_of(frames, [this, src](const detail::FramePtr& frame) {
+        return av_buffersrc_add_frame_flags(src, frame.get(), AV_BUFFERSRC_FLAG_KEEP_REF) >= 0 &&
+               drain_graph();
+    });
+}
+
+bool Pipeline::feed_input(std::size_t index) {
     Input& in = *inputs_[index];
 
-    // Frames decoded during priming come first, then the rest of the file.
-    for (auto& frame : in.queued_v) {
-        if (av_buffersrc_add_frame_flags(in.vsrc, frame.get(), AV_BUFFERSRC_FLAG_KEEP_REF) < 0) return false;
-        if (!drain_graph()) return false;
+    if (!push_frames(in.vsrc, in.queued_v)) {
+        return false;
     }
-    for (auto& frame : in.queued_a) {
-        if (av_buffersrc_add_frame_flags(in.asrc, frame.get(), AV_BUFFERSRC_FLAG_KEEP_REF) < 0) return false;
-        if (!drain_graph()) return false;
+    if (!push_frames(in.asrc, in.queued_a)) {
+        return false;
     }
-    for (auto& pkt : in.queued_pkts) {
-        if (!copy_audio_packet(in, pkt.get())) return false;
+    for (auto& queued_pkt : in.queued_pkts) {
+        if (!copy_audio_packet(in, queued_pkt.get())) {
+            return false;
+        }
     }
     in.queued_v.clear();
     in.queued_a.clear();
     in.queued_pkts.clear();
 
-    PacketPtr pkt = new_packet();
-    if (!pkt) return false;
-    std::vector<FramePtr> frames;
+    detail::PacketPtr pkt = detail::make_packet();
+    if (!pkt) {
+        return false;
+    }
+    std::vector<detail::FramePtr> frames;
 
     for (;;) {
-        int rc = av_read_frame(in.fmt, pkt.get());
-        if (rc == AVERROR_EOF) break;
+        const int rc = av_read_frame(in.fmt.get(), pkt.get());
+        if (rc == AVERROR_EOF) {
+            break;
+        }
         if (rc < 0) {
             BOOST_LOG_TRIVIAL(error) << "Read failed: " << err_str(rc);
             return false;
@@ -831,66 +938,69 @@ bool Pipeline::feed_input(size_t index) {
         AVFilterContext* target = nullptr;
         bool ok = true;
         if (pkt->stream_index == in.v_index) {
-            ok = decode_into(in.vdec, pkt.get(), frames);
+            ok = decode_into(in.vdec.get(), pkt.get(), frames);
             target = in.vsrc;
         } else if (in.adec && pkt->stream_index == in.a_index) {
-            ok = decode_into(in.adec, pkt.get(), frames);
+            ok = decode_into(in.adec.get(), pkt.get(), frames);
             target = in.asrc;
         } else if (pkt->stream_index == in.a_index) {
             ok = copy_audio_packet(in, pkt.get());
         }
         av_packet_unref(pkt.get());
-        if (!ok) return false;
+        if (!ok) {
+            return false;
+        }
 
-        for (auto& frame : frames) {
-            if (av_buffersrc_add_frame_flags(target, frame.get(), AV_BUFFERSRC_FLAG_KEEP_REF) < 0) {
-                return false;
-            }
-            if (!drain_graph()) return false;
+        if (!push_frames(target, frames)) {
+            return false;
         }
         frames.clear();
     }
 
-    // Flush both decoders, then close this segment's pads so concat advances.
-    if (!decode_into(in.vdec, nullptr, frames)) return false;
-    for (auto& frame : frames) {
-        if (av_buffersrc_add_frame_flags(in.vsrc, frame.get(), AV_BUFFERSRC_FLAG_KEEP_REF) < 0) return false;
-        if (!drain_graph()) return false;
+    // Flush decoders and close segment pads so concat advances to the next input.
+    if (!decode_into(in.vdec.get(), nullptr, frames) || !push_frames(in.vsrc, frames)) {
+        return false;
     }
     frames.clear();
 
     if (in.adec) {
-        if (!decode_into(in.adec, nullptr, frames)) return false;
-        for (auto& frame : frames) {
-            if (av_buffersrc_add_frame_flags(in.asrc, frame.get(), AV_BUFFERSRC_FLAG_KEEP_REF) < 0) return false;
-            if (!drain_graph()) return false;
+        if (!decode_into(in.adec.get(), nullptr, frames) || !push_frames(in.asrc, frames)) {
+            return false;
         }
         frames.clear();
     }
 
-    // Closing the pads is what makes the concat filter advance to the next segment.
-    if (av_buffersrc_add_frame(in.vsrc, nullptr) < 0) return false;
-    if (in.asrc && av_buffersrc_add_frame(in.asrc, nullptr) < 0) return false;
+    if (av_buffersrc_add_frame(in.vsrc, nullptr) < 0) {
+        return false;
+    }
+    if (in.asrc && av_buffersrc_add_frame(in.asrc, nullptr) < 0) {
+        return false;
+    }
     return drain_graph();
 }
 
 void Pipeline::report(bool force) {
-    if (!reporter_ || total_sec_ <= 0) return;
+    if (!reporter_ || total_sec_ <= 0.0) {
+        return;
+    }
 
-    auto now = std::chrono::steady_clock::now();
-    if (!force && now - last_report_ < std::chrono::milliseconds(200)) return;
+    const auto now = std::chrono::steady_clock::now();
+    if (!force && (now - last_report_) < kProgressInterval) {
+        return;
+    }
     last_report_ = now;
 
-    double elapsed = std::chrono::duration<double>(now - started_).count();
-    if (elapsed <= 0) return;
+    const double elapsed = std::chrono::duration<double>(now - started_).count();
+    if (elapsed <= 0.0) {
+        return;
+    }
 
-    ProgressParser::Snapshot snap;
-    snap.current_sec = out_sec_;
-    snap.out_time = format_hms(out_sec_);
-    snap.fps   = std::to_string(static_cast<int>(video_frames_ / elapsed));
-    char speed[32];
-    std::snprintf(speed, sizeof(speed), "%.3gx", out_sec_ / elapsed);
-    snap.speed = speed;
+    const ProgressParser::Snapshot snap{
+        .current_sec = out_sec_,
+        .out_time = core::format_hms(out_sec_),
+        .fps = std::to_string(static_cast<int>(video_frames_ / elapsed)),
+        .speed = core::format_speed(out_sec_ / elapsed),
+    };
     reporter_->update(snap, total_sec_);
 }
 
@@ -911,24 +1021,33 @@ bool Pipeline::run(ProgressReporter& reporter, double total_sec) {
         }
     }
 
-    if (!open_inputs()) return false;
-    if (!prime_inputs()) return false;
-    if (!build_graph()) return false;
-    if (!open_encoders()) return false;
-    if (!open_output()) return false;
+    if (!open_inputs() || !prime_inputs() || !build_graph() || !open_encoders() || !open_output()) {
+        return false;
+    }
+
+    drain_frame_ = detail::make_frame();
+    encode_pkt_ = detail::make_packet();
+    if (!drain_frame_ || !encode_pkt_) {
+        return false;
+    }
 
     started_ = std::chrono::steady_clock::now();
     last_report_ = started_;
 
-    for (size_t i = 0; i < inputs_.size(); ++i) {
-        if (!feed_input(i)) return false;
+    for (const std::size_t i : std::views::iota(std::size_t{0}, inputs_.size())) {
+        if (!feed_input(i)) {
+            return false;
+        }
     }
 
-    if (!drain_graph()) return false;
-    if (!encode_video(nullptr)) return false;             // flush
-    if (aenc_ && !encode_audio(nullptr)) return false;
+    if (!drain_graph() || !encode_video(nullptr)) {
+        return false;
+    }
+    if (aenc_ && !encode_audio(nullptr)) {
+        return false;
+    }
 
-    int rc = av_write_trailer(out_);
+    const int rc = av_write_trailer(out_.get());
     if (rc < 0) {
         BOOST_LOG_TRIVIAL(error) << "Could not finalize " << req_.output << ": " << err_str(rc);
         return false;
@@ -945,10 +1064,19 @@ bool transcode(const TranscodeRequest& req, ProgressReporter& reporter, double t
         return false;
     }
     try {
-        ScopedCNumeric numeric_locale;
-        Pipeline pipeline(req);
-        bool ok = pipeline.run(reporter, total_sec);
+        const auto numeric_locale = pin_c_numeric_locale();
+        bool created_output = false;
+        auto remove_partial_output = core::make_scope_guard([&req, &created_output]() noexcept {
+            if (created_output) {
+                std::error_code ec;
+                fs::remove(req.output, ec);
+            }
+        });
+
+        Pipeline pipeline(req, created_output);
+        const bool ok = pipeline.run(reporter, total_sec);
         if (ok) {
+            remove_partial_output.dismiss();
             reporter.finish();
         } else {
             reporter.abort();
@@ -957,6 +1085,10 @@ bool transcode(const TranscodeRequest& req, ProgressReporter& reporter, double t
     } catch (const std::exception& e) {
         reporter.abort();
         BOOST_LOG_TRIVIAL(error) << "Transcode failed: " << e.what();
+        return false;
+    } catch (...) {
+        reporter.abort();
+        BOOST_LOG_TRIVIAL(error) << "Transcode failed with an unknown error.";
         return false;
     }
 }

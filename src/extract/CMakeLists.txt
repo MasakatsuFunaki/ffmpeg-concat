@@ -9,7 +9,7 @@ else()
 endif()
 
 add_library(extractcore STATIC
-    frame_extractor.h
+    frame_extractor.cpp frame_extractor.h
     equally_spaced_extractor.cpp equally_spaced_extractor.h
     striking_frame_extractor.cpp striking_frame_extractor.h
     text_crop_extractor.cpp text_crop_extractor.h

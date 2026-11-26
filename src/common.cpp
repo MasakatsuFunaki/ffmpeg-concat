@@ -1,18 +1,21 @@
 #include "common.h"
 
+#include "core/format_util.h"
 #include "ffmpeg/progress_reporter.h"
-
-#include <locale>
-#include <sstream>
-#include <utility>
 
 namespace po = boost::program_options;
 
-// ---------------------------------------------------------------------------
-// ToolApp – Template Method
-// ---------------------------------------------------------------------------
+ToolApp::~ToolApp() = default;
+
+std::string ToolApp::extra_help() const {
+    return {};
+}
 
 int ToolApp::run(int argc, char* argv[]) {
+    if (argc <= 0 || argv == nullptr) {
+        return 1;
+    }
+
     po::options_description desc(name() + " - Options");
     desc.add_options()
         ("help,h", "Show help message")
@@ -22,10 +25,11 @@ int ToolApp::run(int argc, char* argv[]) {
     po::variables_map vm;
     try {
         po::store(po::parse_command_line(argc, argv, desc), vm);
-        if (argc == 1 || vm.count("help")) {
+        if (argc == 1 || vm.count("help") > 0) {
             BOOST_LOG_TRIVIAL(info) << desc;
-            std::string help = extra_help();
-            if (!help.empty()) BOOST_LOG_TRIVIAL(info) << help;
+            if (const std::string help = extra_help(); !help.empty()) {
+                BOOST_LOG_TRIVIAL(info) << help;
+            }
             return 0;
         }
         po::notify(vm);
@@ -36,11 +40,6 @@ int ToolApp::run(int argc, char* argv[]) {
 
     return execute(vm);
 }
-
-// ---------------------------------------------------------------------------
-// FFmpegUtils – compatibility facade: every static forwards into the
-// decomposed ffmpeg/ and media/ layers (behaviour unchanged).
-// ---------------------------------------------------------------------------
 
 std::time_t FFmpegUtils::get_file_date(const fs::path& filepath) {
     return media::file_date(filepath);
@@ -59,12 +58,12 @@ std::vector<fs::path> FFmpegUtils::collect_video_files(const fs::path& input_dir
 }
 
 bool FFmpegUtils::run_ffmpeg_extract_frame(const fs::path& input_file,
-                                            const fs::path& output_image,
-                                            double timestamp) {
+                                           const fs::path& output_image,
+                                           double timestamp) {
     return Ffmpeg().extract_frame(input_file, output_image, timestamp);
 }
 
-bool FFmpegUtils::run_ffmpeg_concat(const std::vector<fs::path>& input_files,
+bool FFmpegUtils::run_ffmpeg_concat(std::span<const fs::path> input_files,
                                     const fs::path& output_file,
                                     double total_duration_sec) {
     IndicatorsProgressReporter reporter;
@@ -83,8 +82,5 @@ double FFmpegUtils::get_video_duration(const fs::path& input_file) {
 }
 
 std::string FFmpegUtils::fmt_double(double v) {
-    std::ostringstream oss;
-    oss.imbue(std::locale::classic());
-    oss << std::fixed << v;
-    return oss.str();
+    return core::format_fixed(v);
 }

@@ -4,42 +4,54 @@
 
 #include <boost/log/trivial.hpp>
 
-#include <vector>
+#include <algorithm>
+#include <array>
+#include <memory>
+#include <ranges>
+#include <span>
+#include <string>
+#include <string_view>
 
-std::string EncoderCatalog::detect(const std::string& codec) {
-    std::vector<std::string> candidates;
+namespace {
+
+constexpr std::array<std::string_view, 2> kH264Candidates{"h264_nvenc", "libx264"};
+constexpr std::array<std::string_view, 3> kAv1Candidates{"av1_nvenc", "libsvtav1", "libaom-av1"};
+
+[[nodiscard]] std::span<const std::string_view> candidates_for(std::string_view codec) noexcept {
     if (codec == "h264") {
-        candidates = { "h264_nvenc", "libx264" };
-    } else {
-        candidates = { "av1_nvenc", "libsvtav1", "libaom-av1" };
+        return kH264Candidates;
     }
-
-    // Being linked in is necessary but not sufficient: the NVENC wrappers are
-    // always present and only fail when a session is opened against a missing
-    // driver. Confirm each candidate really opens here, preserving the
-    // hardware-first priority order.
-    for (const auto& enc : candidates) {
-        if (!av::encoder_exists(enc)) {
-            continue;  // not built into this libavcodec
-        }
-        if (av::can_use_encoder(enc)) {
-            return enc;
-        }
-        BOOST_LOG_TRIVIAL(warning) << "Encoder '" << enc
-            << "' is linked in but not usable on this host; trying next candidate.";
-    }
-
-    return "";
+    return kAv1Candidates;
 }
 
-std::unique_ptr<EncoderProfile> EncoderCatalog::profile_for(const std::string& encoder) {
+}  // namespace
+
+std::string EncoderCatalog::detect(std::string_view codec) {
+    const auto candidates = candidates_for(codec);
+    const auto it = std::ranges::find_if(candidates, [](std::string_view enc) {
+        if (!av::encoder_exists(enc)) {
+            return false;
+        }
+        if (av::can_use_encoder(enc)) {
+            return true;
+        }
+        BOOST_LOG_TRIVIAL(warning)
+            << "Encoder '" << enc
+            << "' is linked in but not usable on this host; trying next candidate.";
+        return false;
+    });
+    return it != candidates.end() ? std::string{*it} : std::string{};
+}
+
+std::unique_ptr<EncoderProfile> EncoderCatalog::profile_for(std::string_view encoder) {
     if (encoder == "av1_nvenc" || encoder == "h264_nvenc") {
-        return std::make_unique<NvencProfile>(encoder);
-    } else if (encoder == "libsvtav1") {
-        return std::make_unique<SvtAv1Profile>();
-    } else if (encoder == "libx264") {
-        return std::make_unique<X264Profile>();
-    } else {
-        return std::make_unique<LibaomProfile>(encoder);
+        return std::make_unique<NvencProfile>(std::string{encoder});
     }
+    if (encoder == "libsvtav1") {
+        return std::make_unique<SvtAv1Profile>();
+    }
+    if (encoder == "libx264") {
+        return std::make_unique<X264Profile>();
+    }
+    return std::make_unique<LibaomProfile>(std::string{encoder});
 }

@@ -2,28 +2,34 @@
 
 #include "common.h"
 
+#include <compare>
+#include <span>
 #include <string>
 #include <vector>
-#include <utility>
 
-class CutApp : public ToolApp {
+class CutApp final : public ToolApp {
 protected:
-    std::string name() const override;
+    [[nodiscard]] std::string name() const override;
     void define_options(boost::program_options::options_description& desc) override;
-    std::string extra_help() const override;
+    [[nodiscard]] std::string extra_help() const override;
     int execute(const boost::program_options::variables_map& vm) override;
 
 private:
-    using Interval = std::pair<double, double>;
+    struct Interval {
+        double start = 0.0;
+        double end = 0.0;
 
-    std::vector<Interval> parse_intervals(const std::vector<double>& starts,
-                                          const std::vector<double>& ends);
+        [[nodiscard]] constexpr double length() const noexcept { return end - start; }
+        [[nodiscard]] constexpr auto operator<=>(const Interval&) const noexcept = default;
+    };
 
-    bool run_blur(const Ffmpeg& runner,
-                  const fs::path& input_file,
-                  const fs::path& output_file,
-                  const std::vector<Interval>& intervals,
-                  int blur_strength,
-                  bool sound_off,
-                  double duration_sec);
+    [[nodiscard]] static std::vector<Interval> parse_intervals(std::span<const double> starts,
+                                                               std::span<const double> ends);
+
+    [[nodiscard]] static bool run_blur(const fs::path& input_file,
+                                       const fs::path& output_file,
+                                       std::span<const Interval> intervals,
+                                       int blur_strength,
+                                       bool sound_off,
+                                       double duration_sec);
 };

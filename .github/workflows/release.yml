@@ -101,6 +101,12 @@ jobs:
         shell: pwsh
         run: cmake --install ${{ matrix.binary_dir }} --config Release
 
+      - name: Run System Tests (ST) against staged deliverables
+        shell: bash
+        env:
+          FFMPEG_TOOLS_BIN_DIR: ${{ github.workspace }}/${{ matrix.install_dir }}
+        run: ctest --preset ${{ matrix.preset }} -L ST --output-on-failure --timeout 300
+
       - name: Verify installed binaries & runtime dependencies (Linux)
         if: runner.os == 'Linux'
         shell: bash

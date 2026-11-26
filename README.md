@@ -1,6 +1,6 @@
 # FFmpeg Codec Tools
 
-Five fast, self-contained C++17 CLI video tools — `concat_videos`, `transcode`, `cut`, `split`, and `extract` — for **Windows (x64)** and **Linux (x64)**.
+Five fast, self-contained C++20 CLI video tools — `concat_videos`, `transcode`, `cut`, `split`, and `extract` — for **Windows (x64)** and **Linux (x64)**.
 
 Full NLE suites re-encode everything on export even for a simple trim or join, while raw `ffmpeg` filter/remux invocations are verbose and error-prone. **FFmpeg Codec Tools** wraps common video workflows into clean single-command executables with sane defaults:
 
@@ -14,8 +14,8 @@ Full NLE suites re-encode everything on export even for a simple trim or join, w
 
 Download the latest standalone archive for your platform from [**GitHub Releases**](https://github.com/MasakatsuFunaki/ffmpeg-concat/releases):
 
-* **Windows (x64):** `ffmpeg-tools-v2.0.0-windows-x64.zip`
-* **Linux (x64):** `ffmpeg-tools-v2.0.0-linux-x64.tar.gz`
+* **Windows (x64):** `ffmpeg-tools-v2.1.0-windows-x64.zip`
+* **Linux (x64):** `ffmpeg-tools-v2.1.0-linux-x64.tar.gz`
 
 Extract the archive anywhere (optionally add the folder to your `PATH`) and run the executables directly — nothing else needs to be installed. Running any tool with **no arguments** or with `--help` / `-h` displays its full CLI usage.
 
@@ -240,8 +240,9 @@ extract.exe -i my_videos -o frames --image 5 --image-detect --mosaic 4 --extract
 ├── cmake/             # CMake helper modules & build configuration
 ├── src/
 │   ├── common.h/.cpp  # ToolApp base class (Template Method) & FFmpegUtils facade
+│   ├── core/          # C++20 concepts, zero-overhead RAII UniqueHandle/ScopeGuard & std::format utils
 │   ├── av/            # In-process libavformat/libavcodec/libavfilter/libswscale wrappers
-│   ├── ffmpeg/        # Domain Ffmpeg facade & ProgressReporter (indicators progress bars)
+│   ├── ffmpeg/        # Domain Ffmpeg facade & ProgressReporter (PIMPL indicators progress bars)
 │   ├── media/         # Filename date parsing ("YYYY-MM-DD HH-MM-SS"), sorting & timestamp helpers
 │   ├── encode/        # EncoderCatalog runtime probe, EncoderProfile strategies & EncodePlan filter builder
 │   ├── extract/       # OpenCV frame extractors, scorer, MSER text detector, mosaic & SHA-256 cache
@@ -250,7 +251,7 @@ extract.exe -i my_videos -o frames --image 5 --image-detect --mosaic 4 --extract
 │   ├── cut/           # cut CLI
 │   ├── split/         # split CLI
 │   └── extract/       # extract CLI (main entrypoint)
-├── tests/             # GoogleTest suites labeled by tier: UT (Unit Tests) & CT (Component Tests)
+├── tests/             # GoogleTest suites labeled by tier: UT (Unit), CT (Component) & ST (System E2E)
 ├── build.py           # Cross-platform Conan 2 + CMake build, test & install driver
 └── release.py         # Single-branch main release tagger & local packager
 ```
@@ -261,7 +262,7 @@ extract.exe -i my_videos -o frames --image 5 --image-detect --mosaic 4 --extract
 
 ### Prerequisites
 
-* **C++17 compiler:** Visual Studio 2022 (MSVC) on Windows; GCC 11+ on Linux
+* **C++20 compiler:** Visual Studio 2022 (MSVC) on Windows; GCC 13+ on Linux
 * **CMake:** 3.15+
 * **Conan:** 2.x (`pip install conan`, then run `conan profile detect --force` once if you do not have a default profile)
 * **Python:** 3.8+
@@ -274,12 +275,13 @@ extract.exe -i my_videos -o frames --image 5 --image-detect --mosaic 4 --extract
 # Build all 5 Release executables
 python build.py
 
-# Configure with tests enabled, build, and run the full CTest suite (UT + CT)
+# Configure with tests enabled, build, and run the full CTest suite (UT + CT + ST)
 python build.py --test
 
-# Run only Unit Tests (UT) or only Component Tests (CT)
+# Run only Unit Tests (UT), Component Tests (CT), or System Tests (ST)
 python build.py --tier UT
 python build.py --tier CT
+python build.py --tier ST
 
 # Stage standalone deliverables into install/win/ (Windows) or install/linux/ (Linux)
 python build.py --install
@@ -307,7 +309,7 @@ cmake --build --preset conan-linux-release
 ctest --preset conan-linux-release --output-on-failure
 ```
 
-To filter by test tier directly with `ctest`, append `-L UT` or `-L CT`.
+To filter by test tier directly with `ctest`, append `-L UT`, `-L CT`, or `-L ST`.
 
 ---
 
@@ -317,13 +319,13 @@ Releases follow a single-branch workflow on `main`:
 
 ```bash
 # Tag an explicit version on main and push main + the annotated tag to GitHub
-python release.py --tag v2.0.0
+python release.py --tag v2.1.0
 
 # Or automatically bump the latest semver tag (patch | minor | major)
-python release.py --bump patch
+python release.py --bump minor
 ```
 
-Pushing the annotated `v*` tag triggers [`.github/workflows/release.yml`](.github/workflows/release.yml), which builds, runs the `UT`/`CT` test suites, verifies standalone static linkage on both **Windows (x64)** and **Linux (x64)**, and publishes `ffmpeg-tools-<tag>-windows-x64.zip`, `ffmpeg-tools-<tag>-linux-x64.tar.gz`, and `SHA256SUMS.txt` to GitHub Releases.
+Pushing the annotated `v*` tag triggers [`.github/workflows/release.yml`](.github/workflows/release.yml), which builds, runs the `UT`/`CT`/`ST` test suites, verifies standalone static linkage on both **Windows (x64)** and **Linux (x64)**, and publishes `ffmpeg-tools-<tag>-windows-x64.zip`, `ffmpeg-tools-<tag>-linux-x64.tar.gz`, and `SHA256SUMS.txt` to GitHub Releases.
 
 For local packaging or uploading a host archive directly via the GitHub CLI (`gh`), run `python release.py --local`.
 

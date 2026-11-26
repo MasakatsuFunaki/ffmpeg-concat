@@ -5,13 +5,13 @@ cmake_minimum_required(VERSION 3.15)
 #   conan install . --build=missing
 # The generated toolchain is supplied via the CMake preset's toolchainFile.
 
-project(ffmpeg_tools VERSION 2.0.0 LANGUAGES CXX)
+project(ffmpeg_tools VERSION 2.1.0 LANGUAGES CXX)
 
-set(CMAKE_CXX_STANDARD 17)
+set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
 if(MSVC)
-    add_compile_options(/utf-8)
+    add_compile_options(/utf-8 /Zc:__cplusplus)
 endif()
 
 list(APPEND CMAKE_MODULE_PATH "${CMAKE_CURRENT_SOURCE_DIR}/cmake")
@@ -37,6 +37,10 @@ endif()
 
 # Shared library
 add_library(common STATIC src/common.cpp src/common.h
+    src/core/concepts.h
+    src/core/scoped_handle.h
+    src/core/format_util.h
+    src/av/av_handles.h
     src/av/av_error.cpp src/av/av_error.h
     src/av/av_capabilities.cpp src/av/av_capabilities.h
     src/av/media_probe.cpp src/av/media_probe.h
@@ -48,6 +52,7 @@ add_library(common STATIC src/common.cpp src/common.h
     src/ffmpeg/ffmpeg.cpp src/ffmpeg/ffmpeg.h
     src/media/media_fs.cpp src/media/media_fs.h)
 add_library(ffmpeg_tools::common ALIAS common)
+target_compile_features(common PUBLIC cxx_std_20)
 target_link_libraries(common PUBLIC Boost::program_options Boost::filesystem Boost::log indicators::indicators ffmpeg-nvenc::ffmpeg-nvenc ${PLATFORM_LIBS})
 target_include_directories(common PUBLIC ${CMAKE_SOURCE_DIR}/src)
 target_compile_definitions(common PUBLIC ${PLATFORM_DEFS})
