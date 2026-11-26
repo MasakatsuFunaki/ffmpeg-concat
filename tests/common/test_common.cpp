@@ -1,11 +1,17 @@
 #include "common.h"
 #include "av/av_capabilities.h"
 #include "av/av_error.h"
+#include "av/bgr_converter.h"
+#include "av/frame_sampler.h"
 #include "av/media_probe.h"
+#include "core/arch.h"
 #include "core/concepts.h"
 #include "core/format_util.h"
+#include "core/path_util.h"
 #include "core/scoped_handle.h"
 #include "media/media_fs.h"
+#include "platform/locale_guard.h"
+#include "platform/time_util.h"
 #include "support/test_sandbox.hpp"
 
 #include <gtest/gtest.h>
@@ -19,21 +25,30 @@
 
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <chrono>
+#include <clocale>
 #include <cmath>
 #include <cstddef>
 #include <cstdint>
+#include <cstdio>
+#include <cstdlib>
 #include <ctime>
 #include <filesystem>
+#include <fstream>
 #include <iostream>
 #include <limits>
 #include <memory>
+#include <optional>
 #include <ranges>
 #include <span>
 #include <sstream>
 #include <string>
 #include <string_view>
+#include <system_error>
+#include <thread>
 #include <type_traits>
+#include <utility>
 #include <vector>
 
 namespace fs = std::filesystem;
@@ -175,11 +190,12 @@ int c_api_replace_inout(FakeResource** inout, FakeResource* replacement) noexcep
 }
 
 [[nodiscard]] bool to_local_tm(std::time_t value, std::tm& out) noexcept {
-#ifdef _WIN32
-    return localtime_s(&out, &value) == 0;
-#else
-    return localtime_r(&value, &out) != nullptr;
-#endif
+    const std::optional<std::tm> converted = platform::local_time(value);
+    if (!converted.has_value()) {
+        return false;
+    }
+    out = *converted;
+    return true;
 }
 
 [[nodiscard]] bool is_ascii_digit(char c) noexcept {
@@ -283,6 +299,54 @@ protected:
         return return_code;
     }
 };
+
+// FrameSampler must be move-only with noexcept move operations.
+static_assert(!std::is_copy_constructible_v<av::FrameSampler>);
+static_assert(!std::is_copy_assignable_v<av::FrameSampler>);
+static_assert(std::is_nothrow_move_constructible_v<av::FrameSampler>);
+static_assert(std::is_nothrow_move_assignable_v<av::FrameSampler>);
+
+constexpr int kBgr24BytesPerPixel = 3;
+
+[[nodiscard]] std::string bytes_to_string(std::span<const std::uint8_t> bytes) {
+    std::string out;
+    out.reserve(bytes.size());
+    for (const std::uint8_t byte : bytes) {
+        out.push_back(static_cast<char>(byte));
+    }
+    return out;
+}
+
+void expect_utf8_bytes(const std::string& actual,
+                       std::span<const std::uint8_t> expected) {
+    ASSERT_EQ(actual.size(), expected.size());
+    for (std::size_t i = 0; i < expected.size(); ++i) {
+        SCOPED_TRACE(i);
+        EXPECT_EQ(static_cast<std::uint8_t>(static_cast<unsigned char>(actual[i])),
+                  expected[i]);
+    }
+}
+
+void verify_frame_invariants(const av::FrameBuffer& fb,
+                             int expected_width,
+                             int expected_height) {
+    ASSERT_GT(expected_width, 0);
+    ASSERT_GT(expected_height, 0);
+
+    const int expected_stride = expected_width * kBgr24BytesPerPixel;
+    const std::size_t expected_size =
+        static_cast<std::size_t>(expected_height) * static_cast<std::size_t>(expected_stride);
+
+    EXPECT_FALSE(fb.empty());
+    EXPECT_EQ(fb.width, expected_width);
+    EXPECT_EQ(fb.height, expected_height);
+    EXPECT_EQ(fb.stride, expected_stride);
+    ASSERT_EQ(fb.bgr24.size(), expected_size);
+    EXPECT_TRUE(std::isfinite(fb.timestamp_sec));
+
+    const auto [min_it, max_it] = std::ranges::minmax_element(fb.bgr24);
+    EXPECT_LT(*min_it, *max_it);
+}
 
 }  // namespace
 
@@ -616,6 +680,554 @@ TEST(FormatUtilTest, JoinHandlesEmptySingleMultiAndSeparators) {
     EXPECT_EQ(core::join(kMulti, " :: "), "alpha :: beta :: gamma");
 }
 
+// Core UTF-8 <-> std::filesystem::path conversions
+
+TEST(CorePathUtilTest, ToUtf8AndFromUtf8MatchRfc3629ByteMatrix) {
+    struct PathUtf8Case {
+        std::string_view label;
+        std::u8string_view u8_input;
+        std::span<const std::uint8_t> expected_bytes;
+    };
+
+    static constexpr std::array<std::uint8_t, 11> kAsciiBytes{
+        0x63u, 0x6Cu, 0x69u, 0x70u, 0x5Fu, 0x30u, 0x31u, 0x2Eu, 0x6Du, 0x70u, 0x34u};
+    static constexpr std::array<std::uint8_t, 5> kAccentedLatinBytes{
+        0x63u, 0x61u, 0x66u, 0xC3u, 0xA9u};
+    static constexpr std::array<std::uint8_t, 6> kCjkBytes{
+        0xE5u, 0x8Bu, 0x95u, 0xE7u, 0x94u, 0xBBu};
+    static constexpr std::array<std::uint8_t, 4> kEmojiBytes{
+        0xF0u, 0x9Fu, 0x8Eu, 0xACu};
+    static constexpr std::array<std::uint8_t, 21> kMixedBytes{
+        0x63u, 0x61u, 0x66u, 0xC3u, 0xA9u, 0x20u,
+        0xE5u, 0x8Bu, 0x95u, 0xE7u, 0x94u, 0xBBu, 0x20u,
+        0xF0u, 0x9Fu, 0x8Eu, 0xACu, 0x2Eu, 0x6Du, 0x70u, 0x34u};
+
+    constexpr std::array<PathUtf8Case, 6> kCases{{
+        {"empty", u8"", std::span<const std::uint8_t>{}},
+        {"ascii", u8"clip_01.mp4", std::span<const std::uint8_t>{kAsciiBytes}},
+        {"two_byte_latin", u8"caf\u00E9", std::span<const std::uint8_t>{kAccentedLatinBytes}},
+        {"three_byte_cjk", u8"\u52D5\u753B", std::span<const std::uint8_t>{kCjkBytes}},
+        {"four_byte_emoji", u8"\U0001F3AC", std::span<const std::uint8_t>{kEmojiBytes}},
+        {"mixed_unicode",
+         u8"caf\u00E9 \u52D5\u753B \U0001F3AC.mp4",
+         std::span<const std::uint8_t>{kMixedBytes}},
+    }};
+
+    for (const auto& tc : kCases) {
+        SCOPED_TRACE(tc.label);
+        const fs::path native_path{tc.u8_input};
+        const std::string encoded = core::to_utf8(native_path);
+        expect_utf8_bytes(encoded, tc.expected_bytes);
+
+        const std::string raw_utf8 = bytes_to_string(tc.expected_bytes);
+        const fs::path decoded = core::from_utf8(raw_utf8);
+        EXPECT_EQ(decoded, native_path);
+        expect_utf8_bytes(core::to_utf8(decoded), tc.expected_bytes);
+    }
+}
+
+TEST(CorePathUtilTest, NestedUnicodePathPreservesComponentsAndFilesystemRoundTrip) {
+    constexpr std::u8string_view kDirU8 = u8"caf\u00E9_dir";
+    constexpr std::u8string_view kSubU8 = u8"\u52D5\u753B_sub";
+    constexpr std::u8string_view kFileU8 = u8"clip_\U0001F3AC.bin";
+
+    constexpr std::array<std::uint8_t, 9> kDirBytes{
+        0x63u, 0x61u, 0x66u, 0xC3u, 0xA9u, 0x5Fu, 0x64u, 0x69u, 0x72u};
+    constexpr std::array<std::uint8_t, 10> kSubBytes{
+        0xE5u, 0x8Bu, 0x95u, 0xE7u, 0x94u, 0xBBu, 0x5Fu, 0x73u, 0x75u, 0x62u};
+    constexpr std::array<std::uint8_t, 13> kFileBytes{
+        0x63u, 0x6Cu, 0x69u, 0x70u, 0x5Fu, 0xF0u, 0x9Fu, 0x8Eu, 0xACu,
+        0x2Eu, 0x62u, 0x69u, 0x6Eu};
+    constexpr std::array<std::uint8_t, 8> kPayloadBytes{
+        0x00u, 0x46u, 0x46u, 0x7Fu, 0x80u, 0xC3u, 0xE5u, 0xFFu};
+
+    const fs::path nested_rel = fs::path{kDirU8} / fs::path{kSubU8} / fs::path{kFileU8};
+    const fs::path round_tripped_rel = core::from_utf8(core::to_utf8(nested_rel));
+    expect_utf8_bytes(core::to_utf8(round_tripped_rel.filename()), kFileBytes);
+    expect_utf8_bytes(core::to_utf8(round_tripped_rel.parent_path().filename()), kSubBytes);
+    expect_utf8_bytes(
+        core::to_utf8(round_tripped_rel.parent_path().parent_path().filename()), kDirBytes);
+
+    const std::string generic_utf8 =
+        bytes_to_string(kDirBytes) + "/" + bytes_to_string(kSubBytes) + "/" +
+        bytes_to_string(kFileBytes);
+    const fs::path parsed_nested = core::from_utf8(generic_utf8);
+    expect_utf8_bytes(core::to_utf8(parsed_nested.filename()), kFileBytes);
+    expect_utf8_bytes(core::to_utf8(parsed_nested.parent_path().filename()), kSubBytes);
+    expect_utf8_bytes(
+        core::to_utf8(parsed_nested.parent_path().parent_path().filename()), kDirBytes);
+
+    test_support::ScopedTempDir sandbox("ut_path_util");
+    const fs::path full_path = sandbox.path() / nested_rel;
+    const fs::path reopened_path = core::from_utf8(core::to_utf8(full_path));
+
+    std::error_code ec;
+    ASSERT_TRUE(fs::create_directories(reopened_path.parent_path(), ec));
+    ASSERT_FALSE(ec) << ec.message();
+
+    {
+        std::ofstream out(reopened_path, std::ios::binary | std::ios::trunc);
+        ASSERT_TRUE(out.is_open());
+        for (const std::uint8_t byte : kPayloadBytes) {
+            out.put(static_cast<char>(byte));
+        }
+        out.flush();
+        ASSERT_TRUE(out.good());
+    }
+
+    EXPECT_TRUE(fs::is_regular_file(full_path));
+    EXPECT_TRUE(fs::is_regular_file(reopened_path));
+    expect_utf8_bytes(core::to_utf8(reopened_path.filename()), kFileBytes);
+    expect_utf8_bytes(core::to_utf8(reopened_path.parent_path().filename()), kSubBytes);
+    expect_utf8_bytes(
+        core::to_utf8(reopened_path.parent_path().parent_path().filename()), kDirBytes);
+
+    const std::vector<std::byte> actual_bytes =
+        test_support::read_file_bytes(core::from_utf8(core::to_utf8(full_path)));
+    ASSERT_EQ(actual_bytes.size(), kPayloadBytes.size());
+    for (std::size_t i = 0; i < kPayloadBytes.size(); ++i) {
+        SCOPED_TRACE(i);
+        EXPECT_EQ(static_cast<std::uint8_t>(actual_bytes[i]), kPayloadBytes[i]);
+    }
+}
+
+// Platform abstractions (thread-safe locale guard and local calendar time)
+
+TEST(PlatformLocaleGuardTest, PinsDecimalFormattingSupportsMoveNestingAndConcurrentThreads) {
+    static_assert(!std::is_copy_constructible_v<platform::ScopedCNumericLocale>);
+    static_assert(!std::is_copy_assignable_v<platform::ScopedCNumericLocale>);
+    static_assert(std::is_nothrow_move_constructible_v<platform::ScopedCNumericLocale>);
+    static_assert(std::is_nothrow_move_assignable_v<platform::ScopedCNumericLocale>);
+    static_assert(std::is_nothrow_destructible_v<platform::ScopedCNumericLocale>);
+
+    constexpr std::size_t kFormatBufLen = 32;
+    constexpr double kSampleValue = 1.25;
+    constexpr double kParsedExpected = 3.5;
+    constexpr std::string_view kExpectedFormatted = "1.25";
+    constexpr std::string_view kCommaFormatted = "1,25";
+    constexpr std::size_t kWorkerCount = 4;
+    constexpr std::size_t kIterationsPerWorker = 32;
+
+    const auto format_sample = [&]() -> std::string {
+        std::array<char, kFormatBufLen> buf{};
+        const int written = std::snprintf(buf.data(), buf.size(), "%.2f", kSampleValue);
+        if (written <= 0 || static_cast<std::size_t>(written) >= buf.size()) {
+            return {};
+        }
+        return std::string(buf.data(), static_cast<std::size_t>(written));
+    };
+
+    const auto parse_c_double = [](const char* text, double& out) -> bool {
+        char* end = nullptr;
+        out = std::strtod(text, &end);
+        return end != nullptr && *end == '\0';
+    };
+
+    {
+        platform::ScopedCNumericLocale guard;
+        EXPECT_EQ(format_sample(), kExpectedFormatted);
+        double parsed = 0.0;
+        ASSERT_TRUE(parse_c_double("3.5", parsed));
+        EXPECT_DOUBLE_EQ(parsed, kParsedExpected);
+
+        platform::ScopedCNumericLocale moved_ctor(std::move(guard));
+        EXPECT_EQ(format_sample(), kExpectedFormatted);
+
+        platform::ScopedCNumericLocale moved_assign;
+        moved_assign = std::move(moved_ctor);
+        EXPECT_EQ(format_sample(), kExpectedFormatted);
+
+        {
+            const platform::ScopedCNumericLocale inner;
+            EXPECT_EQ(format_sample(), kExpectedFormatted);
+        }
+        EXPECT_EQ(format_sample(), kExpectedFormatted);
+    }
+
+    // Concurrent threads entering and exiting ScopedCNumericLocale must remain race-free.
+    std::atomic<int> worker_failures{0};
+    {
+        std::vector<std::jthread> workers;
+        workers.reserve(kWorkerCount);
+        for (std::size_t t = 0; t < kWorkerCount; ++t) {
+            workers.emplace_back([&]() {
+                for (std::size_t i = 0; i < kIterationsPerWorker; ++i) {
+                    const platform::ScopedCNumericLocale scoped;
+                    if (format_sample() != kExpectedFormatted) {
+                        worker_failures.fetch_add(1, std::memory_order_relaxed);
+                    }
+                    double parsed = 0.0;
+                    if (!parse_c_double("3.5", parsed) || parsed != kParsedExpected) {
+                        worker_failures.fetch_add(1, std::memory_order_relaxed);
+                    }
+                }
+            });
+        }
+    }
+    EXPECT_EQ(worker_failures.load(std::memory_order_relaxed), 0);
+
+    // If a comma-decimal locale exists on the host, verify per-thread pinning and restoration
+    // on an isolated thread while restoring the process-global numeric locale on scope exit.
+    const std::string saved_global_locale = []() -> std::string {
+        const char* cur = std::setlocale(LC_NUMERIC, nullptr);
+        return cur != nullptr ? std::string(cur) : std::string("C");
+    }();
+    const auto restore_global_locale = core::make_scope_guard([&]() {
+        (void)std::setlocale(LC_NUMERIC, saved_global_locale.c_str());
+    });
+
+    std::atomic<bool> comma_restore_mismatch{false};
+    {
+        std::jthread locale_thread([&]() {
+            constexpr std::array<const char*, 3> kCommaLocales{
+                "de_DE.UTF-8", "de-DE", "fr_FR.UTF-8"};
+            const bool installed_comma = [&]() {
+                for (const char* name : kCommaLocales) {
+                    if (std::setlocale(LC_NUMERIC, name) != nullptr &&
+                        format_sample() == kCommaFormatted) {
+                        return true;
+                    }
+                }
+                return false;
+            }();
+            if (!installed_comma) {
+                return;
+            }
+            {
+                const platform::ScopedCNumericLocale guard;
+                if (format_sample() != kExpectedFormatted) {
+                    comma_restore_mismatch.store(true, std::memory_order_relaxed);
+                }
+            }
+            if (format_sample() != kCommaFormatted) {
+                comma_restore_mismatch.store(true, std::memory_order_relaxed);
+            }
+        });
+    }
+    EXPECT_FALSE(comma_restore_mismatch.load(std::memory_order_relaxed));
+}
+
+TEST(PlatformTimeUtilTest, ConvertsCalendarDatesRejectsExtremeBoundsAndIsThreadSafe) {
+    struct CalendarCase {
+        std::string_view label;
+        int year;
+        int month;
+        int day;
+        int hour;
+        int minute;
+        int second;
+    };
+    constexpr std::array<CalendarCase, 3> kCases{{
+        {"y2k_midnight", 2000, 1, 1, 0, 0, 0},
+        {"leap_day_end", 2024, 2, 29, 23, 59, 59},
+        {"capture_date", 2026, 3, 22, 14, 35, 9},
+    }};
+    constexpr int kTmYearBase = 1900;
+    constexpr int kEpochMinTmYear = 69;
+    constexpr int kEpochMaxTmYear = 70;
+    constexpr int kMaxMonthIndex = 11;
+    constexpr int kMaxDayOfMonth = 31;
+    constexpr int kMaxHour = 23;
+    constexpr int kMaxMinute = 59;
+    constexpr int kMaxSecond = 59;
+
+    std::array<std::time_t, kCases.size()> timestamps{};
+    for (std::size_t i = 0; i < kCases.size(); ++i) {
+        const auto& tc = kCases[i];
+        SCOPED_TRACE(tc.label);
+        std::tm input{};
+        input.tm_year = tc.year - kTmYearBase;
+        input.tm_mon = tc.month - 1;
+        input.tm_mday = tc.day;
+        input.tm_hour = tc.hour;
+        input.tm_min = tc.minute;
+        input.tm_sec = tc.second;
+        input.tm_isdst = -1;
+
+        const std::time_t epoch_sec = std::mktime(&input);
+        ASSERT_NE(epoch_sec, static_cast<std::time_t>(-1));
+        timestamps[i] = epoch_sec;
+
+        const std::optional<std::tm> result = platform::local_time(epoch_sec);
+        ASSERT_TRUE(result.has_value());
+        EXPECT_EQ(result->tm_year + kTmYearBase, tc.year);
+        EXPECT_EQ(result->tm_mon + 1, tc.month);
+        EXPECT_EQ(result->tm_mday, tc.day);
+        EXPECT_EQ(result->tm_hour, tc.hour);
+        EXPECT_EQ(result->tm_min, tc.minute);
+        EXPECT_EQ(result->tm_sec, tc.second);
+    }
+
+    const std::optional<std::tm> epoch_zero = platform::local_time(std::time_t{0});
+    ASSERT_TRUE(epoch_zero.has_value());
+    EXPECT_GE(epoch_zero->tm_year, kEpochMinTmYear);
+    EXPECT_LE(epoch_zero->tm_year, kEpochMaxTmYear);
+    EXPECT_GE(epoch_zero->tm_mon, 0);
+    EXPECT_LE(epoch_zero->tm_mon, kMaxMonthIndex);
+    EXPECT_GE(epoch_zero->tm_mday, 1);
+    EXPECT_LE(epoch_zero->tm_mday, kMaxDayOfMonth);
+    EXPECT_GE(epoch_zero->tm_hour, 0);
+    EXPECT_LE(epoch_zero->tm_hour, kMaxHour);
+    EXPECT_GE(epoch_zero->tm_min, 0);
+    EXPECT_LE(epoch_zero->tm_min, kMaxMinute);
+    EXPECT_GE(epoch_zero->tm_sec, 0);
+    EXPECT_LE(epoch_zero->tm_sec, kMaxSecond);
+
+    constexpr std::size_t kMin64BitTimeTBytes = 8U;
+    if constexpr (sizeof(std::time_t) >= kMin64BitTimeTBytes) {
+        EXPECT_FALSE(platform::local_time(std::numeric_limits<std::time_t>::min()).has_value());
+        EXPECT_FALSE(platform::local_time(std::numeric_limits<std::time_t>::max()).has_value());
+    }
+
+    // Concurrent calls with distinct timestamps must not clobber each other.
+    constexpr std::size_t kIterationsPerThread = 64;
+    std::atomic<int> concurrent_mismatches{0};
+    {
+        std::vector<std::jthread> workers;
+        workers.reserve(kCases.size());
+        for (std::size_t idx = 0; idx < kCases.size(); ++idx) {
+            workers.emplace_back([&, idx]() {
+                const auto& expected = kCases[idx];
+                const std::time_t ts = timestamps[idx];
+                for (std::size_t iter = 0; iter < kIterationsPerThread; ++iter) {
+                    const std::optional<std::tm> actual = platform::local_time(ts);
+                    if (!actual.has_value() ||
+                        (actual->tm_year + kTmYearBase) != expected.year ||
+                        (actual->tm_mon + 1) != expected.month ||
+                        actual->tm_mday != expected.day ||
+                        actual->tm_hour != expected.hour ||
+                        actual->tm_min != expected.minute ||
+                        actual->tm_sec != expected.second) {
+                        concurrent_mismatches.fetch_add(1, std::memory_order_relaxed);
+                    }
+                }
+            });
+        }
+    }
+    EXPECT_EQ(concurrent_mismatches.load(std::memory_order_relaxed), 0);
+}
+
+// Architecture-isolated BGRA->BGR24 pixel converter
+
+TEST(AvBgrConverterTest, StripBgraToBgr24HandlesEmptySignBitPixelsAndLengthMismatchSeams) {
+    static_assert(av::BgrConvertPolicy<av::DirectBgr24Policy>);
+    static_assert(av::BgrConvertPolicy<av::BgraBridgePolicy>);
+    static_assert(av::BgrConvertPolicy<av::DefaultBgrConvertPolicy>);
+    static_assert(!av::BgrConvertPolicy<int>);
+    static_assert(std::is_same_v<
+                  av::DefaultBgrConvertPolicy,
+                  std::conditional_t<core::arch::kIsArm64,
+                                     av::BgraBridgePolicy,
+                                     av::DirectBgr24Policy>>);
+
+    // Empty 0 -> 0 succeeds cleanly.
+    EXPECT_TRUE(av::strip_bgra_to_bgr24(std::span<const std::uint8_t>{},
+                                        std::span<std::uint8_t>{}));
+
+    // Pinned 3-pixel vector exercising sign-bit bytes (0x00, 0x7F, 0x80, 0xFF) and distinct alphas.
+    constexpr std::array<std::uint8_t, 12> kBgraInput{{
+        0x00u, 0x7Fu, 0x80u, 0x11u,
+        0xFFu, 0x01u, 0xFEu, 0xAAu,
+        0x12u, 0x34u, 0x56u, 0xFFu,
+    }};
+    constexpr std::array<std::uint8_t, 9> kExpectedBgr24{{
+        0x00u, 0x7Fu, 0x80u,
+        0xFFu, 0x01u, 0xFEu,
+        0x12u, 0x34u, 0x56u,
+    }};
+    std::array<std::uint8_t, kExpectedBgr24.size()> bgr_out{};
+    ASSERT_TRUE(av::strip_bgra_to_bgr24(kBgraInput, bgr_out));
+    EXPECT_EQ(bgr_out, kExpectedBgr24);
+
+    // Length-mismatch boundary seams must return false without mutating destination bytes.
+    constexpr std::uint8_t kSrcFillByte = 0xCCu;
+    constexpr std::uint8_t kSentinelByte = 0x5Au;
+    struct SizeMismatchCase {
+        std::string_view label;
+        std::size_t bgra_len;
+        std::size_t bgr_len;
+    };
+    constexpr std::array<SizeMismatchCase, 7> kMismatchCases{{
+        {"bgra_len_1_not_div4", 1, 0},
+        {"bgra_len_3_not_div4", 3, 0},
+        {"bgra_len_5_not_div4", 5, 3},
+        {"bgr_too_short", 8, 5},
+        {"bgr_too_long", 8, 7},
+        {"empty_src_nonempty_dst", 0, 3},
+        {"nonempty_src_empty_dst", 4, 0},
+    }};
+
+    for (const auto& tc : kMismatchCases) {
+        SCOPED_TRACE(tc.label);
+        const std::vector<std::uint8_t> src(tc.bgra_len, kSrcFillByte);
+        std::vector<std::uint8_t> dst(tc.bgr_len, kSentinelByte);
+        EXPECT_FALSE(av::strip_bgra_to_bgr24(src, dst));
+        EXPECT_TRUE(std::ranges::all_of(dst, [](std::uint8_t b) { return b == kSentinelByte; }));
+    }
+}
+
+TEST(AvBgrConverterTest, DirectAndBgraBridgePoliciesDispatchAndHandleErrorsOnAllArchitectures) {
+    constexpr int kWidth = 2;
+    constexpr int kHeight = 2;
+    constexpr int kDirectStride = kWidth * static_cast<int>(av::kBgr24BytesPerPixel);
+    constexpr int kBgraStride = kWidth * static_cast<int>(av::kBgraBytesPerPixel);
+    constexpr std::size_t kOutBytes =
+        static_cast<std::size_t>(kWidth * kHeight) * av::kBgr24BytesPerPixel;
+    constexpr std::uint8_t kSentinel = 0xA5u;
+    constexpr int kOverflowWidth =
+        (std::numeric_limits<int>::max() / static_cast<int>(av::kBgraBytesPerPixel)) + 1;
+
+    constexpr std::array<std::uint8_t, 16> kFakeBgraPixels{{
+        0x10u, 0x20u, 0x30u, 0xFFu,
+        0x40u, 0x50u, 0x60u, 0x80u,
+        0x7Fu, 0x80u, 0x00u, 0x01u,
+        0xF0u, 0xE1u, 0xD2u, 0x00u,
+    }};
+    constexpr std::array<std::uint8_t, 12> kExpectedStrippedBgr{{
+        0x10u, 0x20u, 0x30u,
+        0x40u, 0x50u, 0x60u,
+        0x7Fu, 0x80u, 0x00u,
+        0xF0u, 0xE1u, 0xD2u,
+    }};
+
+    // Both DirectBgr24Policy and BgraBridgePolicy reject invalid dimensions/overflow/size.
+    auto check_invalid_args = [](auto& converter) {
+        int calls = 0;
+        const auto fail_if_called = [&](bool, std::uint8_t*, int) {
+            ++calls;
+            return true;
+        };
+        std::array<std::uint8_t, kOutBytes> out{};
+        EXPECT_FALSE(converter.convert(0, kHeight, true, out, fail_if_called));
+        EXPECT_FALSE(converter.convert(kWidth, 0, true, out, fail_if_called));
+        EXPECT_FALSE(converter.convert(-1, kHeight, false, out, fail_if_called));
+        EXPECT_FALSE(converter.convert(kOverflowWidth, 1, true, out, fail_if_called));
+        std::array<std::uint8_t, kOutBytes - 1U> short_out{};
+        EXPECT_FALSE(converter.convert(kWidth, kHeight, true, short_out, fail_if_called));
+        EXPECT_EQ(calls, 0);
+    };
+
+    // DirectBgr24Policy always requests direct BGR24 regardless of is_yuv420p.
+    {
+        av::BgrConverter<av::DirectBgr24Policy> direct;
+        check_invalid_args(direct);
+
+        for (const bool is_yuv420p : {true, false}) {
+            SCOPED_TRACE(is_yuv420p);
+            std::array<std::uint8_t, kOutBytes> out{};
+            bool saw_bgra = true;
+            std::uint8_t* saw_dst = nullptr;
+            int saw_stride = 0;
+
+            ASSERT_TRUE(direct.convert(
+                kWidth, kHeight, is_yuv420p, out,
+                [&](bool to_bgra, std::uint8_t* dst, int stride) {
+                    saw_bgra = to_bgra;
+                    saw_dst = dst;
+                    saw_stride = stride;
+                    std::ranges::copy(kExpectedStrippedBgr, dst);
+                    return true;
+                }));
+            EXPECT_FALSE(saw_bgra);
+            EXPECT_EQ(saw_dst, out.data());
+            EXPECT_EQ(saw_stride, kDirectStride);
+            EXPECT_EQ(out, kExpectedStrippedBgr);
+        }
+
+        std::array<std::uint8_t, kOutBytes> out{};
+        EXPECT_FALSE(direct.convert(kWidth, kHeight, true, out,
+                                    [](bool, std::uint8_t*, int) { return false; }));
+        direct.clear();
+    }
+
+    // BgraBridgePolicy routes YUV420P through BGRA scratch + alpha strip, and non-YUV420P direct.
+    {
+        av::BgrConverter<av::BgraBridgePolicy> bridge;
+        check_invalid_args(bridge);
+
+        std::array<std::uint8_t, kOutBytes> out{};
+        bool saw_bgra = false;
+        std::uint8_t* saw_dst = nullptr;
+        int saw_stride = 0;
+        ASSERT_TRUE(bridge.convert(
+            kWidth, kHeight, true, out,
+            [&](bool to_bgra, std::uint8_t* dst, int stride) {
+                saw_bgra = to_bgra;
+                saw_dst = dst;
+                saw_stride = stride;
+                std::ranges::copy(kFakeBgraPixels, dst);
+                return true;
+            }));
+        EXPECT_TRUE(saw_bgra);
+        EXPECT_NE(saw_dst, out.data());
+        EXPECT_EQ(saw_stride, kBgraStride);
+        EXPECT_EQ(out, kExpectedStrippedBgr);
+
+        // Non-YUV420P bypasses the BGRA bridge and writes directly to out_bgr24.
+        out.fill(0U);
+        ASSERT_TRUE(bridge.convert(
+            kWidth, kHeight, false, out,
+            [&](bool to_bgra, std::uint8_t* dst, int stride) {
+                saw_bgra = to_bgra;
+                saw_dst = dst;
+                saw_stride = stride;
+                std::ranges::copy(kExpectedStrippedBgr, dst);
+                return true;
+            }));
+        EXPECT_FALSE(saw_bgra);
+        EXPECT_EQ(saw_dst, out.data());
+        EXPECT_EQ(saw_stride, kDirectStride);
+        EXPECT_EQ(out, kExpectedStrippedBgr);
+
+        // Valid -> Failing -> clear() -> Valid (larger 3x2) state seam.
+        out.fill(kSentinel);
+        EXPECT_FALSE(bridge.convert(kWidth, kHeight, true, out,
+                                    [](bool, std::uint8_t*, int) { return false; }));
+        EXPECT_TRUE(std::ranges::all_of(out, [](std::uint8_t b) { return b == kSentinel; }));
+
+        bridge.clear();
+        constexpr int kLargerWidth = 3;
+        constexpr int kLargerHeight = 2;
+        constexpr std::size_t kLargerPixels =
+            static_cast<std::size_t>(kLargerWidth * kLargerHeight);
+        constexpr std::size_t kBlueOffset = 1U;
+        constexpr std::size_t kGreenOffset = 10U;
+        constexpr std::size_t kRedOffset = 20U;
+        constexpr std::uint8_t kOpaqueAlpha = 0xFFu;
+        constexpr std::size_t kBlueChannel = 0U;
+        constexpr std::size_t kGreenChannel = 1U;
+        constexpr std::size_t kRedChannel = 2U;
+        constexpr std::size_t kAlphaChannel = 3U;
+        std::vector<std::uint8_t> larger_out(kLargerPixels * av::kBgr24BytesPerPixel, 0U);
+        ASSERT_TRUE(bridge.convert(
+            kLargerWidth, kLargerHeight, true, larger_out,
+            [](bool to_bgra, std::uint8_t* dst, int stride) {
+                if (!to_bgra || stride != kLargerWidth * static_cast<int>(av::kBgraBytesPerPixel)) {
+                    return false;
+                }
+                for (std::size_t p = 0; p < kLargerPixels; ++p) {
+                    const std::size_t base = p * av::kBgraBytesPerPixel;
+                    dst[base + kBlueChannel] = static_cast<std::uint8_t>(p + kBlueOffset);
+                    dst[base + kGreenChannel] = static_cast<std::uint8_t>(p + kGreenOffset);
+                    dst[base + kRedChannel] = static_cast<std::uint8_t>(p + kRedOffset);
+                    dst[base + kAlphaChannel] = kOpaqueAlpha;
+                }
+                return true;
+            }));
+        ASSERT_EQ(larger_out.size(), kLargerPixels * av::kBgr24BytesPerPixel);
+        for (std::size_t p = 0; p < kLargerPixels; ++p) {
+            SCOPED_TRACE(p);
+            const std::size_t base = p * av::kBgr24BytesPerPixel;
+            EXPECT_EQ(larger_out[base + kBlueChannel],
+                      static_cast<std::uint8_t>(p + kBlueOffset));
+            EXPECT_EQ(larger_out[base + kGreenChannel],
+                      static_cast<std::uint8_t>(p + kGreenOffset));
+            EXPECT_EQ(larger_out[base + kRedChannel],
+                      static_cast<std::uint8_t>(p + kRedOffset));
+        }
+    }
+}
+
 // Media filesystem helpers
 
 TEST(MediaFsTest, CurrentTimestampMatchesFormatAndLocalClock) {
@@ -893,6 +1505,295 @@ TEST(AvProbeTest, ReadsRealCaptureMetadata) {
     EXPECT_TRUE(info.has_audio);
     EXPECT_EQ(info.video_codec, "hevc");
     EXPECT_EQ(info.audio_codec, "aac");
+}
+
+// AV reusable video frame sampler
+
+TEST(AvFrameSamplerTest, DefaultStateAndInvalidFilesStayClosed) {
+    constexpr int kSampleWidth = 2;
+    constexpr int kSampleHeight = 1;
+    constexpr int kSampleStride = kSampleWidth * kBgr24BytesPerPixel;
+    constexpr std::size_t kSamplePixelBytes =
+        static_cast<std::size_t>(kSampleHeight) * static_cast<std::size_t>(kSampleStride);
+    constexpr std::uint8_t kSamplePixelValue = 0x7Fu;
+    constexpr std::array<double, 2> kProbeTimestamps{0.5, 2.0};
+
+    // FrameBuffer::empty() boundary predicate matrix across all 4 fields.
+    const std::vector<std::uint8_t> populated_pixels(kSamplePixelBytes, kSamplePixelValue);
+    struct BufferEmptyCase {
+        std::string_view label;
+        int width;
+        int height;
+        int stride;
+        bool has_pixels;
+        bool expected_empty;
+    };
+    constexpr std::array<BufferEmptyCase, 6> kBufferCases{{
+        {"default_zeroed", 0, 0, 0, false, true},
+        {"zero_width", 0, kSampleHeight, kSampleStride, true, true},
+        {"zero_height", kSampleWidth, 0, kSampleStride, true, true},
+        {"zero_stride", kSampleWidth, kSampleHeight, 0, true, true},
+        {"empty_pixels", kSampleWidth, kSampleHeight, kSampleStride, false, true},
+        {"valid_bgr24", kSampleWidth, kSampleHeight, kSampleStride, true, false},
+    }};
+    for (const auto& tc : kBufferCases) {
+        SCOPED_TRACE(tc.label);
+        av::FrameBuffer fb;
+        fb.width = tc.width;
+        fb.height = tc.height;
+        fb.stride = tc.stride;
+        if (tc.has_pixels) {
+            fb.bgr24 = populated_pixels;
+        }
+        EXPECT_EQ(fb.empty(), tc.expected_empty);
+    }
+
+    av::FrameSampler sampler;
+    EXPECT_FALSE(sampler.is_open());
+    EXPECT_EQ(sampler.width(), 0);
+    EXPECT_EQ(sampler.height(), 0);
+    EXPECT_LE(sampler.duration_sec(), 0.0);
+    EXPECT_FALSE(sampler.sample_at(0.0).has_value());
+
+    std::size_t callback_calls = 0;
+    EXPECT_EQ(sampler.sample_timestamps(
+                  kProbeTimestamps,
+                  [&](std::size_t, av::FrameBuffer&&) { ++callback_calls; }),
+              0u);
+    EXPECT_EQ(callback_calls, 0u);
+
+    test_support::ScopedTempDir sandbox("ut_av_frame_sampler");
+    const std::array<fs::path, 3> bad_files{
+        sandbox.child("nonexistent_sampler.mp4"),
+        sandbox.write_bytes("empty_sampler.mp4", {}),
+        sandbox.write_text("corrupt_sampler.mp4", "not a valid media container payload"),
+    };
+
+    for (const auto& bad : bad_files) {
+        SCOPED_TRACE(core::to_utf8(bad.filename()));
+        EXPECT_FALSE(sampler.open(bad));
+        EXPECT_FALSE(sampler.is_open());
+        EXPECT_EQ(sampler.width(), 0);
+        EXPECT_EQ(sampler.height(), 0);
+        EXPECT_LE(sampler.duration_sec(), 0.0);
+        EXPECT_FALSE(sampler.sample_at(0.0).has_value());
+    }
+}
+
+TEST(AvFrameSamplerTest, SamplesFixtureAndUnicodePathWithValidErrorValidSeam) {
+    constexpr double kDurationToleranceSec = 0.5;
+    constexpr double kEarlyTimestampSec = 0.5;
+    constexpr double kMidTimestampSec = 2.0;
+    constexpr double kLateTimestampSec = 8.0;
+    constexpr double kNegativeTimestampSec = -1.0;
+    constexpr double kPastEofOffsetSec = 10.0;
+    constexpr std::u8string_view kUnicodeRelPath =
+        u8"sampler_caf\u00E9_\u52D5\u753B/clip_\u52D5\u753B.mp4";
+
+    const fs::path fixture = test_support::fixture_path(test_support::kFixtureMainVideo);
+    ASSERT_TRUE(fs::is_regular_file(fixture)) << "Missing fixture: " << core::to_utf8(fixture);
+
+    const av::MediaInfo probe = av::probe(fixture);
+    ASSERT_TRUE(probe.ok);
+    ASSERT_GT(probe.width, 0);
+    ASSERT_GT(probe.height, 0);
+    ASSERT_GT(probe.duration_sec, 0.0);
+
+    test_support::ScopedTempDir sandbox("ut_frame_sampler_unicode");
+    const fs::path unicode_copy = sandbox.copy_in(fixture, kUnicodeRelPath);
+    ASSERT_TRUE(fs::is_regular_file(unicode_copy));
+
+    struct PathCase {
+        std::string_view label;
+        fs::path video_path;
+    };
+    const std::array<PathCase, 2> paths{{
+        {"committed_fixture", fixture},
+        {"unicode_copy", unicode_copy},
+    }};
+
+    for (const auto& path_case : paths) {
+        SCOPED_TRACE(path_case.label);
+        av::FrameSampler sampler;
+        ASSERT_TRUE(sampler.open(path_case.video_path));
+        EXPECT_TRUE(sampler.is_open());
+        EXPECT_EQ(sampler.width(), probe.width);
+        EXPECT_EQ(sampler.height(), probe.height);
+        EXPECT_NEAR(sampler.duration_sec(), probe.duration_sec, kDurationToleranceSec);
+
+        // Valid decode before injecting out-of-range / non-finite timestamps.
+        const auto early = sampler.sample_at(kEarlyTimestampSec);
+        ASSERT_TRUE(early.has_value());
+        verify_frame_invariants(*early, probe.width, probe.height);
+
+        struct InvalidTimestampCase {
+            std::string_view label;
+            double timestamp_sec;
+        };
+        const std::array<InvalidTimestampCase, 5> invalid_timestamps{{
+            {"negative", kNegativeTimestampSec},
+            {"quiet_nan", std::numeric_limits<double>::quiet_NaN()},
+            {"pos_inf", std::numeric_limits<double>::infinity()},
+            {"neg_inf", -std::numeric_limits<double>::infinity()},
+            {"past_eof", sampler.duration_sec() + kPastEofOffsetSec},
+        }};
+        for (const auto& bad : invalid_timestamps) {
+            SCOPED_TRACE(bad.label);
+            EXPECT_FALSE(sampler.sample_at(bad.timestamp_sec).has_value());
+            EXPECT_TRUE(sampler.is_open());
+        }
+
+        // Subsequent valid decodes must still succeed cleanly after rejected timestamps.
+        const auto mid = sampler.sample_at(kMidTimestampSec);
+        ASSERT_TRUE(mid.has_value());
+        verify_frame_invariants(*mid, probe.width, probe.height);
+
+        const auto late = sampler.sample_at(kLateTimestampSec);
+        ASSERT_TRUE(late.has_value());
+        verify_frame_invariants(*late, probe.width, probe.height);
+        EXPECT_GT(late->timestamp_sec, early->timestamp_sec);
+        EXPECT_NE(early->bgr24, late->bgr24);
+    }
+}
+
+TEST(AvFrameSamplerTest, SampleTimestampsDecodesSequentialFramesAndSkipsInvalidEntries) {
+    constexpr std::array<double, 4> kSequentialTimestamps{0.5, 2.0, 5.0, 8.0};
+    constexpr std::array<double, 3> kMixedTimestamps{0.5, -1.0, 8.0};
+    constexpr std::size_t kExpectedMixedDecoded = 2;
+    constexpr std::size_t kFirstValidIndex = 0;
+    constexpr std::size_t kLastValidIndex = 2;
+
+    const fs::path fixture = test_support::fixture_path(test_support::kFixtureMainVideo);
+    ASSERT_TRUE(fs::is_regular_file(fixture)) << "Missing fixture: " << core::to_utf8(fixture);
+
+    const av::MediaInfo probe = av::probe(fixture);
+    ASSERT_TRUE(probe.ok);
+
+    av::FrameSampler sampler;
+    ASSERT_TRUE(sampler.open(fixture));
+
+    std::size_t empty_calls = 0;
+    EXPECT_EQ(sampler.sample_timestamps(
+                  std::span<const double>{},
+                  [&](std::size_t, av::FrameBuffer&&) { ++empty_calls; }),
+              0u);
+    EXPECT_EQ(empty_calls, 0u);
+
+    std::vector<std::size_t> indices;
+    std::vector<av::FrameBuffer> frames;
+    indices.reserve(kSequentialTimestamps.size());
+    frames.reserve(kSequentialTimestamps.size());
+
+    const std::size_t decoded_count = sampler.sample_timestamps(
+        kSequentialTimestamps,
+        [&](std::size_t idx, av::FrameBuffer&& frame) {
+            indices.push_back(idx);
+            frames.push_back(std::move(frame));
+        });
+
+    ASSERT_EQ(decoded_count, kSequentialTimestamps.size());
+    ASSERT_EQ(indices.size(), kSequentialTimestamps.size());
+    ASSERT_EQ(frames.size(), kSequentialTimestamps.size());
+
+    for (std::size_t i = 0; i < kSequentialTimestamps.size(); ++i) {
+        SCOPED_TRACE(i);
+        EXPECT_EQ(indices[i], i);
+        verify_frame_invariants(frames[i], probe.width, probe.height);
+        if (i > 0u) {
+            EXPECT_GE(frames[i].timestamp_sec, frames[i - 1u].timestamp_sec);
+        }
+    }
+    EXPECT_GT(frames.back().timestamp_sec, frames.front().timestamp_sec);
+    EXPECT_NE(frames.front().bgr24, frames.back().bgr24);
+
+    // Invalid entry mid-span is skipped while preserving original input indices.
+    std::vector<std::size_t> mixed_indices;
+    std::vector<av::FrameBuffer> mixed_frames;
+    const std::size_t mixed_count = sampler.sample_timestamps(
+        kMixedTimestamps,
+        [&](std::size_t idx, av::FrameBuffer&& frame) {
+            mixed_indices.push_back(idx);
+            mixed_frames.push_back(std::move(frame));
+        });
+
+    ASSERT_EQ(mixed_count, kExpectedMixedDecoded);
+    ASSERT_EQ(mixed_indices.size(), kExpectedMixedDecoded);
+    ASSERT_EQ(mixed_frames.size(), kExpectedMixedDecoded);
+    EXPECT_EQ(mixed_indices[0], kFirstValidIndex);
+    EXPECT_EQ(mixed_indices[1], kLastValidIndex);
+    verify_frame_invariants(mixed_frames[0], probe.width, probe.height);
+    verify_frame_invariants(mixed_frames[1], probe.width, probe.height);
+    EXPECT_NE(mixed_frames[0].bgr24, mixed_frames[1].bgr24);
+}
+
+TEST(AvFrameSamplerTest, SupportsMoveConstructionAssignmentCloseAndReopen) {
+    constexpr double kEarlyTimestampSec = 0.5;
+    constexpr double kMidTimestampSec = 2.0;
+
+    const fs::path fixture = test_support::fixture_path(test_support::kFixtureMainVideo);
+    ASSERT_TRUE(fs::is_regular_file(fixture)) << "Missing fixture: " << core::to_utf8(fixture);
+
+    const av::MediaInfo probe = av::probe(fixture);
+    ASSERT_TRUE(probe.ok);
+
+    av::FrameSampler orig;
+    ASSERT_TRUE(orig.open(fixture));
+    ASSERT_TRUE(orig.is_open());
+
+    av::FrameSampler moved_ctor(std::move(orig));
+    EXPECT_FALSE(orig.is_open());
+    EXPECT_EQ(orig.width(), 0);
+    EXPECT_EQ(orig.height(), 0);
+    EXPECT_LE(orig.duration_sec(), 0.0);
+    EXPECT_FALSE(orig.sample_at(kEarlyTimestampSec).has_value());
+
+    EXPECT_TRUE(moved_ctor.is_open());
+    EXPECT_EQ(moved_ctor.width(), probe.width);
+    EXPECT_EQ(moved_ctor.height(), probe.height);
+    const auto ctor_frame = moved_ctor.sample_at(kEarlyTimestampSec);
+    ASSERT_TRUE(ctor_frame.has_value());
+    verify_frame_invariants(*ctor_frame, probe.width, probe.height);
+
+    av::FrameSampler moved_assign;
+    moved_assign = std::move(moved_ctor);
+    EXPECT_FALSE(moved_ctor.is_open());
+    EXPECT_FALSE(moved_ctor.sample_at(kEarlyTimestampSec).has_value());
+
+    EXPECT_TRUE(moved_assign.is_open());
+    EXPECT_EQ(moved_assign.width(), probe.width);
+    EXPECT_EQ(moved_assign.height(), probe.height);
+    const auto assign_frame = moved_assign.sample_at(kMidTimestampSec);
+    ASSERT_TRUE(assign_frame.has_value());
+    verify_frame_invariants(*assign_frame, probe.width, probe.height);
+
+    moved_assign.close();
+    EXPECT_FALSE(moved_assign.is_open());
+    EXPECT_EQ(moved_assign.width(), 0);
+    EXPECT_EQ(moved_assign.height(), 0);
+    EXPECT_LE(moved_assign.duration_sec(), 0.0);
+    EXPECT_FALSE(moved_assign.sample_at(kEarlyTimestampSec).has_value());
+
+    // Closing an already-closed sampler is idempotent.
+    moved_assign.close();
+    EXPECT_FALSE(moved_assign.is_open());
+
+    // Reopen after close, then verify failed open resets state and subsequent open recovers.
+    ASSERT_TRUE(moved_assign.open(fixture));
+    EXPECT_TRUE(moved_assign.is_open());
+    const auto reopened_frame = moved_assign.sample_at(kEarlyTimestampSec);
+    ASSERT_TRUE(reopened_frame.has_value());
+    verify_frame_invariants(*reopened_frame, probe.width, probe.height);
+
+    test_support::ScopedTempDir sandbox("ut_frame_sampler_reopen");
+    EXPECT_FALSE(moved_assign.open(sandbox.child("missing_reopen.mp4")));
+    EXPECT_FALSE(moved_assign.is_open());
+    EXPECT_FALSE(moved_assign.sample_at(kEarlyTimestampSec).has_value());
+
+    ASSERT_TRUE(moved_assign.open(fixture));
+    EXPECT_TRUE(moved_assign.is_open());
+    const auto recovered_frame = moved_assign.sample_at(kMidTimestampSec);
+    ASSERT_TRUE(recovered_frame.has_value());
+    verify_frame_invariants(*recovered_frame, probe.width, probe.height);
 }
 
 // ToolApp Template Method contract

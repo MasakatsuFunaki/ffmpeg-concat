@@ -1,5 +1,6 @@
 #include "concat.h"
 
+#include "core/path_util.h"
 #include "core/scoped_handle.h"
 #include "ffmpeg/progress_reporter.h"
 
@@ -28,11 +29,11 @@ void ConcatApp::define_options(po::options_description& desc) {
 }
 
 int ConcatApp::execute(const po::variables_map& vm) {
-    const fs::path input_dir  = fs::absolute(vm["input"].as<std::string>());
-    const fs::path output_dir = fs::absolute(vm["output"].as<std::string>());
+    const fs::path input_dir  = fs::absolute(core::from_utf8(vm["input"].as<std::string>()));
+    const fs::path output_dir = fs::absolute(core::from_utf8(vm["output"].as<std::string>()));
 
     if (!fs::exists(input_dir) || !fs::is_directory(input_dir)) {
-        BOOST_LOG_TRIVIAL(error) << "Error: Input directory does not exist: " << input_dir;
+        BOOST_LOG_TRIVIAL(error) << "Error: Input directory does not exist: " << core::to_utf8(input_dir);
         return 1;
     }
 
@@ -48,13 +49,13 @@ int ConcatApp::execute(const po::variables_map& vm) {
 
     BOOST_LOG_TRIVIAL(info) << std::format("Found {} MP4 files to concatenate:", mp4_files.size());
     for (const auto& file : mp4_files) {
-        BOOST_LOG_TRIVIAL(info) << std::format("  - {}", file.filename().string());
+        BOOST_LOG_TRIVIAL(info) << std::format("  - {}", core::to_utf8(file.filename()));
     }
 
     const std::string timestamp = media::current_timestamp();
-    fs::path output_file = output_dir / std::format("concatenated_{}.mp4", timestamp);
+    fs::path output_file = output_dir / core::from_utf8(std::format("concatenated_{}.mp4", timestamp));
     for (std::size_t suffix = 1; fs::exists(output_file); ++suffix) {
-        output_file = output_dir / std::format("concatenated_{}_{}.mp4", timestamp, suffix);
+        output_file = output_dir / core::from_utf8(std::format("concatenated_{}_{}.mp4", timestamp, suffix));
     }
 
     Ffmpeg runner;
@@ -65,7 +66,7 @@ int ConcatApp::execute(const po::variables_map& vm) {
             return d > 0.0 ? d : 0.0;
         });
 
-    BOOST_LOG_TRIVIAL(info) << "Concatenating to: " << output_file;
+    BOOST_LOG_TRIVIAL(info) << "Concatenating to: " << core::to_utf8(output_file);
 
     auto remove_partial_output = core::make_scope_guard([&output_file]() noexcept {
         std::error_code ec;
@@ -86,6 +87,6 @@ int ConcatApp::execute(const po::variables_map& vm) {
 #ifndef TESTING_NO_MAIN
 int main(int argc, char* argv[]) {
     ConcatApp app;
-    return app.run(argc, argv);
+    return app.run_cli(argc, argv);
 }
 #endif

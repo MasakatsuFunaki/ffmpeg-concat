@@ -28,9 +28,11 @@ using test_support::kFixtureMainVideo;
 using test_support::kFixtureUniformClip1;
 using test_support::list_all_entries;
 using test_support::list_regular_files;
+using test_support::path_to_utf8;
 using test_support::probe_valid_media;
 using test_support::require_fixture;
 using test_support::run_tool_app;
+using test_support::u8_to_utf8;
 using test_support::verify_decodable_frame_at;
 
 constexpr double kFpsTolerance = 1.0;
@@ -53,6 +55,15 @@ constexpr double kSeam1ProbeSec = 4.2;
 constexpr double kSeam2ProbeSec = 10.2;
 constexpr double kEndMarginSec = 0.5;
 constexpr std::size_t kMaxFaultArgs = 6;
+constexpr std::size_t kExpectedSingleEntry = 1;
+constexpr std::size_t kExpectedThreeParts = 3;
+constexpr int kPartIndex1 = 1;
+constexpr int kPartIndex2 = 2;
+constexpr int kPartIndex3 = 3;
+constexpr std::u8string_view kUnicodeInDir = u8"in_café_動画";
+constexpr std::u8string_view kUnicodeOutDir = u8"out_café_動画";
+constexpr std::u8string_view kUnicodeClipRel = u8"in_café_動画/café_動画_clip.mp4";
+constexpr std::u8string_view kUnicodeClipStem = u8"café_動画_clip";
 
 struct SplitFaultCase {
     std::string_view label;
@@ -75,7 +86,8 @@ constexpr std::array<SplitFaultCase, 7> kSplitFaultCases{{
     const fs::path& dir, std::string_view stem, int part_index) {
     const std::string prefix = std::string(stem) + "_part" + std::to_string(part_index) + "_";
     const auto matches = list_regular_files(dir, ".mp4", prefix);
-    EXPECT_EQ(1u, matches.size()) << "Expected exactly 1 file matching " << prefix << "*.mp4 in " << dir;
+    EXPECT_EQ(1u, matches.size())
+        << "Expected exactly 1 file matching " << prefix << "*.mp4 in " << path_to_utf8(dir);
     return matches.empty() ? fs::path{} : matches.front();
 }
 
@@ -358,11 +370,78 @@ TEST(SplitComponentTest, InvalidInputsAndPointsFailWithoutPartialOutputs) {
         const int rc = run_tool_app<SplitApp>(std::span<const std::string>{args});
         EXPECT_EQ(1, rc);
         EXPECT_TRUE(list_all_entries(out_dir).empty())
-            << "Failed split invocation left stray/partial files in " << out_dir;
+            << "Failed split invocation left stray/partial files in " << path_to_utf8(out_dir);
     }
 
     EXPECT_TRUE(input_snap.is_unchanged());
     EXPECT_EQ(1u, list_all_entries(in_dir).size());
+}
+
+TEST(SplitComponentTest, UnicodeNonAsciiPathsSplitIntoThreeValidParts) {
+    const fs::path fixture = require_fixture(kFixtureMainVideo);
+    ASSERT_TRUE(fs::is_regular_file(fixture));
+
+    ScopedTempDir sandbox("split_unicode");
+    const fs::path in_dir = sandbox.create_subdir(kUnicodeInDir);
+    const fs::path out_dir = sandbox.create_subdir(kUnicodeOutDir);
+    ScopedTempDir scratch("split_unicode_frames");
+
+    const fs::path input_copy = sandbox.copy_in(fixture, kUnicodeClipRel);
+    const FileSnapshot input_snap(input_copy);
+    const av::MediaInfo src_info = probe_valid_media(input_copy);
+    ASSERT_TRUE(src_info.ok);
+
+    const std::string in_arg = path_to_utf8(input_copy);
+    const std::string out_arg = path_to_utf8(out_dir);
+    const int rc = run_tool_app<SplitApp>({
+        "split",
+        "-i", in_arg,
+        "-o", out_arg,
+        "-p", "4", "10",
+    });
+    ASSERT_EQ(0, rc);
+    EXPECT_TRUE(input_snap.is_unchanged());
+    EXPECT_EQ(kExpectedSingleEntry, list_all_entries(in_dir).size());
+    ASSERT_EQ(kExpectedThreeParts, list_all_entries(out_dir).size())
+        << "Expected exact 3 split parts with zero stray files";
+
+    const std::string utf8_stem = u8_to_utf8(kUnicodeClipStem);
+    const fs::path part1 = find_single_part(out_dir, utf8_stem, kPartIndex1);
+    const fs::path part2 = find_single_part(out_dir, utf8_stem, kPartIndex2);
+    const fs::path part3 = find_single_part(out_dir, utf8_stem, kPartIndex3);
+    ASSERT_FALSE(part1.empty());
+    ASSERT_FALSE(part2.empty());
+    ASSERT_FALSE(part3.empty());
+
+    const MediaExpectation stream_parity{
+        .video_codec = "hevc",
+        .audio_codec = "aac",
+        .width = src_info.width,
+        .height = src_info.height,
+        .has_video = true,
+        .has_audio = true,
+        .expected_fps = src_info.frame_rate.value(),
+        .fps_tolerance = kFpsTolerance,
+    };
+
+    const av::MediaInfo p1 = probe_valid_media(part1, stream_parity);
+    const av::MediaInfo p2 = probe_valid_media(part2, stream_parity);
+    const av::MediaInfo p3 = probe_valid_media(part3, stream_parity);
+    ASSERT_TRUE(p1.ok && p2.ok && p3.ok);
+
+    EXPECT_GT(p1.duration_sec, kAbsPart1MinSec);
+    EXPECT_NEAR(p1.duration_sec, kAbsPoint1Sec, kPartDurationToleranceSec);
+    EXPECT_GT(p2.duration_sec, kAbsPart2MinSec);
+    EXPECT_NEAR(p2.duration_sec, kAbsPoint2Sec - kAbsPoint1Sec, kPartDurationToleranceSec);
+    EXPECT_GT(p3.duration_sec, kAbsPart3MinSec);
+    EXPECT_NEAR(p3.duration_sec, src_info.duration_sec - kAbsPoint2Sec, kPartDurationToleranceSec);
+    EXPECT_NEAR(p1.duration_sec + p2.duration_sec + p3.duration_sec,
+                src_info.duration_sec,
+                kSumDurationToleranceSec);
+
+    verify_decodable_frame_at(part1, kProbeOffsetSec, scratch, "unicode_p1.jpg");
+    verify_decodable_frame_at(part2, kProbeOffsetSec, scratch, "unicode_p2.jpg");
+    verify_decodable_frame_at(part3, kProbeOffsetSec, scratch, "unicode_p3.jpg");
 }
 
 }  // namespace

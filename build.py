@@ -46,12 +46,30 @@ def linux_sys_pkg_conf():
     return conf
 
 
-def split_ctest_passthrough(argv):
-    """Split arguments before and after '--' so extra args forward directly to ctest."""
+def split_passthrough(argv):
+    """Split arguments before and after '--' so extra args forward to ctest or benchmarks."""
     if "--" in argv:
         sep = argv.index("--")
         return argv[:sep], argv[sep + 1:]
     return argv, []
+
+
+def find_benchmark_executable(preset):
+    """Locate the built ffmpeg_tools_bench binary across single- and multi-config generators."""
+    binary_dir = "build/Release" if "linux" in preset else "build"
+    exe_name = "ffmpeg_tools_bench.exe" if IS_WINDOWS else "ffmpeg_tools_bench"
+    candidates = [
+        os.path.join(PROJECT_ROOT, binary_dir, "benchmark", "bin", "Release", exe_name),
+        os.path.join(PROJECT_ROOT, binary_dir, "benchmark", "bin", exe_name),
+        os.path.join(PROJECT_ROOT, binary_dir, "benchmark", "Release", exe_name),
+        os.path.join(PROJECT_ROOT, binary_dir, "benchmark", exe_name),
+    ]
+    for path in candidates:
+        if os.path.isfile(path):
+            return path
+    raise FileNotFoundError(
+        f"Benchmark executable '{exe_name}' not found. Checked: {', '.join(candidates)}"
+    )
 
 
 def main():
@@ -105,6 +123,11 @@ def main():
         help="Run only the selected test tier (UT, CT, or ST via 'ctest -L <tier>'); implies --test",
     )
     parser.add_argument(
+        "--benchmark",
+        action="store_true",
+        help="Configure with -DBUILD_BENCHMARKS=ON, build, and run the Google Benchmark suite",
+    )
+    parser.add_argument(
         "--deploy",
         action="store_true",
         help=(
@@ -118,10 +141,12 @@ def main():
         help="When used with --deploy, forward --local to release.py to build, package, and upload locally",
     )
 
-    our_argv, ctest_extra = split_ctest_passthrough(sys.argv[1:])
+    our_argv, passthrough_extra = split_passthrough(sys.argv[1:])
     args = parser.parse_args(our_argv)
 
-    run_tests = args.test or (args.tier is not None) or bool(ctest_extra)
+    run_tests = args.test or (args.tier is not None) or (bool(passthrough_extra) and not args.benchmark)
+    ctest_extra = passthrough_extra if run_tests else []
+    bench_extra = passthrough_extra if (args.benchmark and not run_tests) else []
 
     if args.clean:
         print("\n--- Cleaning build tree ---")
@@ -132,10 +157,10 @@ def main():
         print("\n--- Purging local ffmpeg-nvenc Conan cache ---")
         run_cmd(["conan", "remove", "ffmpeg-nvenc/*", "-c"])
 
-    # If --deploy is requested without an explicit local test/install step, hand
+    # If --deploy is requested without an explicit local test/install/benchmark step, hand
     # off directly to release.py (which tags 'main' for GitHub Actions, or runs
     # 'build.py --install' itself when --local is passed).
-    if args.deploy and not run_tests and not args.install:
+    if args.deploy and not run_tests and not args.install and not args.benchmark:
         release_cmd = [sys.executable, os.path.join(PROJECT_ROOT, "release.py")]
         if args.local:
             release_cmd.append("--local")
@@ -157,9 +182,13 @@ def main():
     )
 
     print("\n--- Configuring CMake ---")
-    configure_cmd = ["cmake", "--preset", args.preset]
-    if run_tests:
-        configure_cmd.append("-DBUILD_TESTING=ON")
+    configure_cmd = [
+        "cmake",
+        "--preset",
+        args.preset,
+        f"-DBUILD_TESTING={'ON' if run_tests else 'OFF'}",
+        f"-DBUILD_BENCHMARKS={'ON' if args.benchmark else 'OFF'}",
+    ]
     run_cmd(configure_cmd)
 
     print(f"\n--- Building (parallel jobs: {args.jobs}) ---")
@@ -183,6 +212,12 @@ def main():
             ctest_cmd.extend(ctest_extra)
         print("\n--- Running Tests ---")
         run_cmd(ctest_cmd)
+
+    if args.benchmark:
+        bench_exe = find_benchmark_executable(args.preset)
+        bench_cmd = [bench_exe] + bench_extra
+        print("\n--- Running Benchmarks ---")
+        run_cmd(bench_cmd)
 
     if args.deploy:
         release_cmd = [sys.executable, os.path.join(PROJECT_ROOT, "release.py")]

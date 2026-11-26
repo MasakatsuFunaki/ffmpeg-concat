@@ -1,6 +1,7 @@
 #include "split.h"
 
 #include "core/format_util.h"
+#include "core/path_util.h"
 #include "core/scoped_handle.h"
 
 #include <boost/program_options.hpp>
@@ -44,13 +45,13 @@ std::string SplitApp::extra_help() const {
 }
 
 int SplitApp::execute(const po::variables_map& vm) {
-    const fs::path input_file = fs::absolute(vm["input"].as<std::string>());
+    const fs::path input_file = fs::absolute(core::from_utf8(vm["input"].as<std::string>()));
     const auto raw_points     = vm["points"].as<std::vector<double>>();
     const bool relative       = vm.count("relative") > 0;
     const std::string out_str = vm["output"].as<std::string>();
 
     if (!fs::exists(input_file) || !fs::is_regular_file(input_file)) {
-        BOOST_LOG_TRIVIAL(error) << "Error: Input file does not exist: " << input_file;
+        BOOST_LOG_TRIVIAL(error) << "Error: Input file does not exist: " << core::to_utf8(input_file);
         return 1;
     }
 
@@ -105,13 +106,15 @@ int SplitApp::execute(const po::variables_map& vm) {
         " ");
     BOOST_LOG_TRIVIAL(info) << std::format("Splitting into {} parts at: {}", num_parts, point_list);
 
-    const fs::path out_dir = out_str.empty() ? input_file.parent_path() : fs::absolute(out_str);
+    const fs::path out_dir = out_str.empty()
+        ? input_file.parent_path()
+        : fs::absolute(core::from_utf8(out_str));
     if (!out_str.empty()) {
         fs::create_directories(out_dir);
     }
 
-    const std::string stem = input_file.stem().string();
-    const std::string ext  = input_file.extension().string();
+    const std::string stem = core::to_utf8(input_file.stem());
+    const std::string ext  = core::to_utf8(input_file.extension());
     const std::string ts   = media::current_timestamp();
 
     std::vector<fs::path> written_parts;
@@ -127,11 +130,11 @@ int SplitApp::execute(const po::variables_map& vm) {
     for (std::size_t i = 0; i < num_parts; ++i) {
         const double seg_end     = (i < points.size()) ? points[i] : -1.0;
         const double display_end = (seg_end >= 0.0) ? seg_end : duration;
-        const fs::path part_path = out_dir / std::format("{}_part{}_{}{}", stem, i + 1, ts, ext);
+        const fs::path part_path = out_dir / core::from_utf8(std::format("{}_part{}_{}{}", stem, i + 1, ts, ext));
 
         BOOST_LOG_TRIVIAL(info) << std::format(
             "Part {}/{}: [{}, {}] s -> {}",
-            i + 1, num_parts, seg_start, display_end, part_path.filename().string());
+            i + 1, num_parts, seg_start, display_end, core::to_utf8(part_path.filename()));
 
         written_parts.push_back(part_path);
         if (!runner.run_segment(input_file, part_path, seg_start, seg_end)) {
@@ -149,7 +152,7 @@ int SplitApp::execute(const po::variables_map& vm) {
     }
 
     cleanup_on_failure.dismiss();
-    BOOST_LOG_TRIVIAL(info) << "Success! " << num_parts << " parts saved to: " << out_dir;
+    BOOST_LOG_TRIVIAL(info) << "Success! " << num_parts << " parts saved to: " << core::to_utf8(out_dir);
     return 0;
 }
 
@@ -167,6 +170,6 @@ std::vector<double> SplitApp::compute_absolute_points(std::span<const double> po
 #ifndef TESTING_NO_MAIN
 int main(int argc, char* argv[]) {
     SplitApp app;
-    return app.run(argc, argv);
+    return app.run_cli(argc, argv);
 }
 #endif

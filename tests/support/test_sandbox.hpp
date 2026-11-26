@@ -29,6 +29,32 @@ namespace test_support {
 
 namespace fs = std::filesystem;
 
+[[nodiscard]] inline std::string u8_to_utf8(std::u8string_view u8) {
+    std::string out;
+    out.reserve(u8.size());
+    for (const char8_t ch : u8) {
+        out.push_back(static_cast<char>(ch));
+    }
+    return out;
+}
+
+[[nodiscard]] inline std::string path_to_utf8(const fs::path& p) {
+    return u8_to_utf8(p.u8string());
+}
+
+[[nodiscard]] inline fs::path path_from_utf8(std::string_view utf8) {
+    std::u8string u8;
+    u8.reserve(utf8.size());
+    for (const char ch : utf8) {
+        u8.push_back(static_cast<char8_t>(static_cast<unsigned char>(ch)));
+    }
+    return fs::path{u8};
+}
+
+[[nodiscard]] inline fs::path path_from_u8(std::u8string_view u8) {
+    return fs::path{u8};
+}
+
 [[nodiscard]] inline std::uint64_t current_pid() noexcept {
 #ifdef _WIN32
     return static_cast<std::uint64_t>(_getpid());
@@ -77,9 +103,21 @@ public:
 
     [[nodiscard]] const fs::path& path() const noexcept { return path_; }
 
-    [[nodiscard]] fs::path child(std::string_view rel) const { return path_ / fs::path(rel); }
+    [[nodiscard]] fs::path child(std::string_view rel) const {
+        return path_ / path_from_utf8(rel);
+    }
+
+    [[nodiscard]] fs::path child(std::u8string_view rel) const {
+        return path_ / path_from_u8(rel);
+    }
 
     [[nodiscard]] fs::path create_subdir(std::string_view rel) const {
+        auto dir = child(rel);
+        fs::create_directories(dir);
+        return dir;
+    }
+
+    [[nodiscard]] fs::path create_subdir(std::u8string_view rel) const {
         auto dir = child(rel);
         fs::create_directories(dir);
         return dir;
@@ -92,7 +130,8 @@ public:
         }
         std::ofstream out(target, std::ios::binary | std::ios::trunc);
         if (!out) {
-            throw std::runtime_error(std::format("Failed to open for writing: {}", target.string()));
+            throw std::runtime_error(
+                std::format("Failed to open for writing: {}", path_to_utf8(target)));
         }
         if (!data.empty()) {
             out.write(reinterpret_cast<const char*>(data.data()),
@@ -100,7 +139,8 @@ public:
         }
         out.flush();
         if (!out) {
-            throw std::runtime_error(std::format("Failed writing bytes to: {}", target.string()));
+            throw std::runtime_error(
+                std::format("Failed writing bytes to: {}", path_to_utf8(target)));
         }
         return target;
     }
@@ -111,6 +151,15 @@ public:
     }
 
     fs::path copy_in(const fs::path& src, std::string_view dest_rel = {}) const {
+        auto dst = dest_rel.empty() ? (path_ / src.filename()) : child(dest_rel);
+        if (dst.has_parent_path()) {
+            fs::create_directories(dst.parent_path());
+        }
+        fs::copy_file(src, dst, fs::copy_options::overwrite_existing);
+        return dst;
+    }
+
+    fs::path copy_in(const fs::path& src, std::u8string_view dest_rel) const {
         auto dst = dest_rel.empty() ? (path_ / src.filename()) : child(dest_rel);
         if (dst.has_parent_path()) {
             fs::create_directories(dst.parent_path());
@@ -135,7 +184,8 @@ private:
 [[nodiscard]] inline std::vector<std::byte> read_file_bytes(const fs::path& p) {
     std::ifstream in(p, std::ios::binary | std::ios::ate);
     if (!in) {
-        throw std::runtime_error(std::format("Failed to open for reading: {}", p.string()));
+        throw std::runtime_error(
+            std::format("Failed to open for reading: {}", path_to_utf8(p)));
     }
     const auto end_pos = in.tellg();
     if (end_pos < 0) {
@@ -176,7 +226,7 @@ struct ContentDigest {
 [[nodiscard]] inline ContentDigest digest_file(const fs::path& p) {
     std::ifstream in(p, std::ios::binary);
     if (!in) {
-        throw std::runtime_error(std::format("digest_file: cannot open {}", p.string()));
+        throw std::runtime_error(std::format("digest_file: cannot open {}", path_to_utf8(p)));
     }
     constexpr std::uint64_t kFnvOffset = 14695981039346656037ULL;
     constexpr std::uint64_t kFnvPrime = 1099511628211ULL;
@@ -236,16 +286,17 @@ private:
             continue;
         }
         const auto& p = entry.path();
-        if (!extension_filter.empty() && p.extension().string() != extension_filter) {
+        if (!extension_filter.empty() && path_to_utf8(p.extension()) != extension_filter) {
             continue;
         }
-        if (!filename_prefix.empty() && !p.filename().string().starts_with(filename_prefix)) {
+        if (!filename_prefix.empty() &&
+            !path_to_utf8(p.filename()).starts_with(filename_prefix)) {
             continue;
         }
         result.push_back(p);
     }
     std::ranges::sort(result, [](const fs::path& a, const fs::path& b) {
-        return a.filename().string() < b.filename().string();
+        return path_to_utf8(a.filename()) < path_to_utf8(b.filename());
     });
     return result;
 }
@@ -259,7 +310,7 @@ private:
         result.push_back(entry.path());
     }
     std::ranges::sort(result, [](const fs::path& a, const fs::path& b) {
-        return a.filename().string() < b.filename().string();
+        return path_to_utf8(a.filename()) < path_to_utf8(b.filename());
     });
     return result;
 }
@@ -274,7 +325,7 @@ private:
 }
 
 [[nodiscard]] inline fs::path fixture_path(std::string_view rel) {
-    return fs::path(TEST_DATA_DIR) / fs::path(rel);
+    return path_from_utf8(TEST_DATA_DIR) / path_from_utf8(rel);
 }
 
 inline constexpr std::string_view kFixtureMainVideo = "2026-03-22 00-16-33.mp4";

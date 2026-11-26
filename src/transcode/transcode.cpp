@@ -4,6 +4,7 @@
 #include "av/media_probe.h"
 #include "av/transcoder.h"
 #include "core/format_util.h"
+#include "core/path_util.h"
 #include "core/scoped_handle.h"
 #include "encode/encode_plan.h"
 #include "encode/encoder_catalog.h"
@@ -39,8 +40,8 @@ void TranscodeApp::define_options(po::options_description& desc) {
 }
 
 int TranscodeApp::execute(const po::variables_map& vm) {
-    const fs::path input_path = fs::absolute(vm["input"].as<std::string>());
-    const fs::path output_dir = fs::absolute(vm["output"].as<std::string>());
+    const fs::path input_path = fs::absolute(core::from_utf8(vm["input"].as<std::string>()));
+    const fs::path output_dir = fs::absolute(core::from_utf8(vm["output"].as<std::string>()));
     const int crf             = vm["crf"].as<int>();
     std::string preset        = vm["preset"].as<std::string>();
     std::string encoder       = vm["encoder"].as<std::string>();
@@ -55,7 +56,8 @@ int TranscodeApp::execute(const po::variables_map& vm) {
     const bool input_is_dir  = fs::is_directory(input_path);
 
     if (!fs::exists(input_path) || (!input_is_file && !input_is_dir)) {
-        BOOST_LOG_TRIVIAL(error) << "Error: Input path does not exist or is not a file/directory: " << input_path;
+        BOOST_LOG_TRIVIAL(error) << "Error: Input path does not exist or is not a file/directory: "
+                                 << core::to_utf8(input_path);
         return 1;
     }
 
@@ -77,17 +79,17 @@ int TranscodeApp::execute(const po::variables_map& vm) {
     if (input_is_file) {
         files_to_encode.push_back(input_path);
         BOOST_LOG_TRIVIAL(info) << std::format(
-            "Input is a single file: {}", input_path.filename().string());
+            "Input is a single file: {}", core::to_utf8(input_path.filename()));
     } else {
         files_to_encode = media::collect_mp4_files(input_path);
         if (files_to_encode.empty()) {
-            BOOST_LOG_TRIVIAL(error) << "Error: No MP4 files found in " << input_path;
+            BOOST_LOG_TRIVIAL(error) << "Error: No MP4 files found in " << core::to_utf8(input_path);
             return 1;
         }
 
         BOOST_LOG_TRIVIAL(info) << std::format("Found {} MP4 file(s):", files_to_encode.size());
         for (const auto& file : files_to_encode) {
-            BOOST_LOG_TRIVIAL(info) << std::format("  - {}", file.filename().string());
+            BOOST_LOG_TRIVIAL(info) << std::format("  - {}", core::to_utf8(file.filename()));
         }
 
         if (files_to_encode.size() == 1) {
@@ -97,23 +99,24 @@ int TranscodeApp::execute(const po::variables_map& vm) {
         }
     }
 
-    fs::create_directories(output_dir);
-
-    const std::string timestamp = media::current_timestamp();
-    fs::path output_file = output_dir / std::format("transcoded_{}.mp4", timestamp);
-    for (std::size_t suffix = 1; fs::exists(output_file); ++suffix) {
-        output_file = output_dir / std::format("transcoded_{}_{}.mp4", timestamp, suffix);
-    }
-
     const bool use_concat_filter = files_to_encode.size() > 1;
     double total_duration_sec = 0.0;
+    std::size_t audio_count = 0;
     std::vector<av::FrameRate> frame_rates;
     if (use_concat_filter) {
         frame_rates.reserve(files_to_encode.size());
     }
 
+    // Probe and validate stream compatibility before creating any output directories or files.
     for (const auto& file : files_to_encode) {
         const av::MediaInfo info = av::probe(file);
+        if (!info.ok) {
+            BOOST_LOG_TRIVIAL(error) << "Error: Could not probe input file: " << core::to_utf8(file);
+            return 1;
+        }
+        if (info.has_audio) {
+            ++audio_count;
+        }
         if (info.duration_sec > 0.0) {
             total_duration_sec += info.duration_sec;
         }
@@ -123,12 +126,32 @@ int TranscodeApp::execute(const po::variables_map& vm) {
         }
     }
 
+    if (audio_count > 0 && audio_count < files_to_encode.size()) {
+        BOOST_LOG_TRIVIAL(error)
+            << "Error: Mixed audio streams across inputs (some files have audio and some do not). "
+               "Re-encode or separate audio-less clips before concatenating.";
+        return 1;
+    }
+
+    const bool has_audio = (audio_count == files_to_encode.size());
+    if (!has_audio) {
+        BOOST_LOG_TRIVIAL(info) << "Input(s) have no audio stream; transcoding video only.";
+    }
+
+    fs::create_directories(output_dir);
+
+    const std::string timestamp = media::current_timestamp();
+    fs::path output_file = output_dir / core::from_utf8(std::format("transcoded_{}.mp4", timestamp));
+    for (std::size_t suffix = 1; fs::exists(output_file); ++suffix) {
+        output_file = output_dir / core::from_utf8(std::format("transcoded_{}_{}.mp4", timestamp, suffix));
+    }
+
     if (total_duration_sec > 0.0) {
         BOOST_LOG_TRIVIAL(info) << std::format(
             "Total duration: {}", core::format_hms(total_duration_sec));
     }
 
-    BOOST_LOG_TRIVIAL(info) << "Encoding with " << encoder << ": " << output_file;
+    BOOST_LOG_TRIVIAL(info) << "Encoding with " << encoder << ": " << core::to_utf8(output_file);
 
     // CUDA availability is a host property, so probe it once per run.
     const bool hwaccel_cuda = av::can_use_hwaccel("cuda");
@@ -151,6 +174,7 @@ int TranscodeApp::execute(const po::variables_map& vm) {
         .preset = std::move(preset),
         .hwaccel_cuda = hwaccel_cuda,
         .target_fps = target_fps,
+        .has_audio = has_audio,
     };
 
     const av::TranscodeRequest request = build_request(plan);
@@ -175,6 +199,6 @@ int TranscodeApp::execute(const po::variables_map& vm) {
 #ifndef TESTING_NO_MAIN
 int main(int argc, char* argv[]) {
     TranscodeApp app;
-    return app.run(argc, argv);
+    return app.run_cli(argc, argv);
 }
 #endif

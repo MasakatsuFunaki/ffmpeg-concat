@@ -165,6 +165,62 @@ TEST(BuildFilterDescriptionTest, TableCoversEmptySingleMultiAndExactRationals) {
     }
 }
 
+TEST(BuildFilterDescriptionTest, VideoOnlyTableOmitsAudioPadsAndStreams) {
+    struct VideoOnlyFilterCase {
+        std::string_view label;
+        std::size_t input_count;
+        av::FrameRate target_fps;
+        std::string_view expected;
+    };
+
+    constexpr std::array<VideoOnlyFilterCase, 7> kCases{{
+        {"empty_inputs_no_fps", 0, kUnprobed, ""},
+        {"empty_inputs_with_fps", 0, kFps30, ""},
+        {"single_input_passthrough", 1, kUnprobed, "[in0v]null[outv]"},
+        {"single_input_with_fps", 1, kFps30, "[in0v]fps=30/1[outv]"},
+        {"two_inputs_plain_concat",
+         2,
+         kUnprobed,
+         "[in0v][in1v]concat=n=2:v=1:a=0[outv]"},
+        {"two_inputs_normalized_fps",
+         2,
+         kFps30,
+         "[in0v]fps=30/1[v0];[in1v]fps=30/1[v1];"
+         "[v0][v1]concat=n=2:v=1:a=0[outv]"},
+        {"three_inputs_exact_ntsc_rational",
+         3,
+         kFps2997,
+         "[in0v]fps=30000/1001[v0];[in1v]fps=30000/1001[v1];[in2v]fps=30000/1001[v2];"
+         "[v0][v1][v2]concat=n=3:v=1:a=0[outv]"},
+    }};
+    constexpr std::array<std::string_view, 5> kForbiddenAudioTokens{
+        "in0a", "in1a", "in2a", "outa", "anull"};
+
+    const EncodePlan default_plan{};
+    EXPECT_TRUE(default_plan.has_audio);
+
+    EncodePlan audio_plan = make_base_plan(1);
+    EncodePlan video_only_plan = audio_plan;
+    video_only_plan.has_audio = false;
+    EXPECT_NE(audio_plan, video_only_plan);
+
+    for (const auto& tc : kCases) {
+        SCOPED_TRACE(tc.label);
+        EncodePlan plan = make_base_plan(tc.input_count);
+        plan.target_fps = tc.target_fps;
+        plan.has_audio = false;
+
+        const std::string filter = build_filter_description(plan);
+        EXPECT_EQ(filter, tc.expected);
+        EXPECT_EQ(filter.find('.'), std::string::npos);
+        EXPECT_EQ(filter.find(','), std::string::npos);
+        for (const std::string_view token : kForbiddenAudioTokens) {
+            SCOPED_TRACE(token);
+            EXPECT_EQ(filter.find(token), std::string::npos);
+        }
+    }
+}
+
 TEST(BuildRequestTest, MapsPlanFieldsAndHandWrittenFilterGraph) {
     constexpr std::string_view kExpectedFilter =
         "[in0v]fps=30/1[v0];[in1v]fps=30/1[v1];"
@@ -192,6 +248,44 @@ TEST(BuildRequestTest, MapsPlanFieldsAndHandWrittenFilterGraph) {
     EXPECT_EQ(req.audio_encoder, "aac");
     EXPECT_EQ(req.audio_bit_rate, kExpectedAudioBitRate);
     EXPECT_FALSE(req.audio_copy);
+}
+
+TEST(BuildRequestTest, MapsVideoOnlyPlanWithoutAudioPads) {
+    constexpr std::string_view kExpectedSingleFilter = "[in0v]null[outv]";
+    constexpr std::string_view kExpectedMultiFilter =
+        "[in0v]fps=30/1[v0];[in1v]fps=30/1[v1];"
+        "[v0][v1]concat=n=2:v=1:a=0[outv]";
+    constexpr std::array<std::string_view, 4> kForbiddenAudioTokens{
+        "in0a", "in1a", "outa", "anull"};
+
+    EncodePlan single_plan = make_base_plan(1);
+    single_plan.has_audio = false;
+    const av::TranscodeRequest single_req = build_request(single_plan);
+    EXPECT_EQ(single_req.inputs, single_plan.inputs);
+    EXPECT_EQ(single_req.output, single_plan.output);
+    EXPECT_EQ(single_req.video_encoder, "libx264");
+    EXPECT_EQ(single_req.filter_description, kExpectedSingleFilter);
+    EXPECT_FALSE(single_req.audio_copy);
+    for (const std::string_view token : kForbiddenAudioTokens) {
+        SCOPED_TRACE(token);
+        EXPECT_EQ(single_req.filter_description.find(token), std::string::npos);
+    }
+
+    EncodePlan multi_plan = make_base_plan(2);
+    multi_plan.has_audio = false;
+    multi_plan.hwaccel_cuda = true;
+    multi_plan.target_fps = kFps30;
+    const av::TranscodeRequest multi_req = build_request(multi_plan);
+    EXPECT_EQ(multi_req.inputs, multi_plan.inputs);
+    EXPECT_EQ(multi_req.output, multi_plan.output);
+    EXPECT_EQ(multi_req.video_encoder, "libx264");
+    EXPECT_TRUE(multi_req.hwaccel_cuda);
+    EXPECT_EQ(multi_req.filter_description, kExpectedMultiFilter);
+    EXPECT_FALSE(multi_req.audio_copy);
+    for (const std::string_view token : kForbiddenAudioTokens) {
+        SCOPED_TRACE(token);
+        EXPECT_EQ(multi_req.filter_description.find(token), std::string::npos);
+    }
 }
 
 TEST(BuildRequestTest, EncoderDialectMatrixCoversAllProfilesDefaultsAndCrfBoundaries) {

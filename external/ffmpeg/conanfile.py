@@ -7,9 +7,11 @@ explicitly include `--disable-cuda` / `--disable-cuvid` and there is no
 `with_nvcodec` option. The transcode tool in this repo uses `h264_nvenc` and
 `av1_nvenc` (plus CUDA/NVDEC hardware decoding), so we maintain our own recipe.
 
-This recipe builds and packages ONLY the static `libav*` libraries and headers
-(`--disable-programs`, `--disable-avdevice`, `--disable-autodetect`), so the C++
-tools link the codecs directly into their own executables with deterministic
+This recipe builds and packages ONLY the pruned static `libav*` libraries and
+headers (`--disable-everything`, `--disable-programs`, `--disable-avdevice`,
+`--disable-postproc`, `--disable-network`, `--disable-autodetect`) with explicit
+format/codec/filter allowlists and per-library Conan components, so each C++
+tool links only the FFmpeg libraries it actually needs with deterministic
 dependencies across Windows and Linux.
 
 Build prerequisites (handled by Conan automatically via tool_requires):
@@ -105,6 +107,9 @@ class FFmpegNvencConan(ConanFile):
             "--disable-autodetect",
             "--disable-programs",
             "--disable-avdevice",
+            "--disable-postproc",
+            "--disable-network",
+            "--disable-everything",
             "--enable-w32threads" if self.settings.os == "Windows" else "--enable-pthreads",
             "--disable-doc",
             "--disable-debug",
@@ -114,9 +119,9 @@ class FFmpegNvencConan(ConanFile):
             "--disable-txtpages",
             "--disable-shared",
             "--enable-static",
-            # GPL is required by libx264.
+            # GPL is required by libx264 and boxblur.
             "--enable-gpl",
-            # Encoders we actually use.
+            # External encoders/decoders we actually use.
             "--enable-libx264",
             "--enable-libsvtav1",
             "--enable-libaom",
@@ -132,6 +137,80 @@ class FFmpegNvencConan(ConanFile):
             "--pkg-config=pkgconf",
             "--pkg-config-flags=--static",
         ]
+
+        # Explicit component allowlists covering all five tools and common
+        # real-world video/audio/image formats (.mp4, .mov, .m4v, .mkv, .webm,
+        # .avi, .flv, .wmv, .ts, .jpg, .png, .bmp).
+        demuxers = (
+            "mov", "matroska", "avi", "flv", "mpegts", "asf", "mpegps",
+            "ogg", "wav", "mp3", "aac", "flac",
+            "image2", "mjpeg", "rawvideo", "h264", "hevc", "ivf",
+        )
+        muxers = (
+            "mp4", "mov", "matroska", "webm", "avi", "flv", "mpegts", "asf",
+            "image2", "mjpeg", "null",
+        )
+        decoders = (
+            # Video
+            "h264", "hevc", "av1", "libaom_av1", "vp8", "vp9",
+            "mpeg4", "mpeg2video", "mpeg1video", "msmpeg4v3",
+            "wmv1", "wmv2", "wmv3", "vc1", "flv", "h263",
+            "mjpeg", "png", "bmp", "rawvideo", "prores", "theora",
+            # NVIDIA CUVID
+            "h264_cuvid", "hevc_cuvid", "av1_cuvid", "vp8_cuvid", "vp9_cuvid",
+            # Audio
+            "aac", "aac_latm", "mp3", "mp2", "opus", "vorbis",
+            "ac3", "eac3", "flac", "alac", "wmav1", "wmav2",
+            "pcm_s16le", "pcm_s16be", "pcm_s24le", "pcm_s24be",
+            "pcm_s32le", "pcm_f32le", "pcm_u8", "pcm_mulaw", "pcm_alaw",
+        )
+        encoders = (
+            # Video (configure uses underscore `libaom_av1`; runtime name is `libaom-av1`)
+            "libx264", "libsvtav1", "libaom_av1",
+            "h264_nvenc", "av1_nvenc", "hevc_nvenc",
+            "mjpeg", "png", "bmp",
+            # Audio
+            "aac", "pcm_s16le",
+        )
+        hwaccels = (
+            "h264_nvdec", "hevc_nvdec", "av1_nvdec", "vp8_nvdec", "vp9_nvdec",
+            "mpeg1_nvdec", "mpeg2_nvdec", "mpeg4_nvdec", "vc1_nvdec", "mjpeg_nvdec",
+        )
+        parsers = (
+            "h264", "hevc", "av1", "vp8", "vp9",
+            "mpeg4video", "mpegvideo", "mjpeg", "vc1",
+            "aac", "aac_latm", "mpegaudio", "opus", "vorbis", "ac3", "flac",
+        )
+        bsfs = (
+            "h264_mp4toannexb", "hevc_mp4toannexb", "aac_adtstoasc",
+            "extract_extradata",
+            "av1_frame_split", "av1_frame_merge", "av1_metadata",
+            "vp9_superframe", "vp9_superframe_split", "null",
+        )
+        protocols = ("file", "pipe")
+        # Note: `fifo`/`afifo` were removed in FFmpeg 7.0+ (graph scheduler buffers natively).
+        filters = (
+            "buffer", "abuffer", "buffersink", "abuffersink",
+            "null", "anull", "nullsink", "anullsink", "copy",
+            "fps", "concat", "split", "gblur", "boxblur",
+            "scale", "overlay", "volume",
+            "format", "aformat", "aresample",
+            "setpts", "asetpts", "trim", "atrim",
+        )
+
+        for kind, names in (
+            ("demuxer", demuxers),
+            ("muxer", muxers),
+            ("decoder", decoders),
+            ("encoder", encoders),
+            ("hwaccel", hwaccels),
+            ("parser", parsers),
+            ("bsf", bsfs),
+            ("protocol", protocols),
+            ("filter", filters),
+        ):
+            tc.configure_args.extend(f"--enable-{kind}={name}" for name in names)
+
         if self.settings.os != "Windows":
             # Compile C sources with -fPIC and x86_64 NASM objects with -DPIC
             # so static libav* links cleanly into PIE executables on Linux.
@@ -260,31 +339,56 @@ class FFmpegNvencConan(ConanFile):
                 os.remove(path)
 
     # ------------------------------------------------------------------ #
-    # Consumer-facing info
+    # Consumer-facing info (per-library Conan 2 components)
     # ------------------------------------------------------------------ #
     def package_info(self):
-        # Declared in link order: every library only depends on ones after it.
-        # postproc is built because --enable-gpl turns it on, and libavfilter's
-        # vf_pp references it, so consumers must link it even though no filter
-        # this project uses needs it.
-        self.cpp_info.libs = [
-            "avfilter", "avformat", "avcodec", "postproc",
-            "swresample", "swscale", "avutil",
-        ]
-        self.cpp_info.includedirs = ["include"]
-        self.cpp_info.libdirs = ["lib"]
-        self.cpp_info.bindirs = []
+        # Expose each static FFmpeg library as its own Conan component so
+        # lightweight tools link only what they use (e.g. ffmpeg-nvenc::avformat
+        # without avfilter/swscale/swresample). CMakeDeps also generates the
+        # full aggregate target ffmpeg-nvenc::ffmpeg-nvenc automatically.
+        def _add_component(name, requires):
+            comp = self.cpp_info.components[name]
+            comp.libs = [name]
+            comp.includedirs = ["include"]
+            comp.libdirs = ["lib"]
+            comp.bindirs = []
+            comp.requires = requires
+            return comp
+
+        avutil = _add_component("avutil", ["nv-codec-headers::nv-codec-headers"])
+        _add_component("swscale", ["avutil"])
+        _add_component("swresample", ["avutil"])
+        avcodec = _add_component(
+            "avcodec",
+            [
+                "swresample",
+                "avutil",
+                "libx264::libx264",
+                "libsvtav1::libsvtav1",
+                "libaom-av1::libaom-av1",
+                "nv-codec-headers::nv-codec-headers",
+            ],
+        )
+        avformat = _add_component("avformat", ["avcodec", "avutil"])
+        _add_component(
+            "avfilter",
+            ["avformat", "avcodec", "swscale", "swresample", "avutil"],
+        )
 
         if self.settings.os == "Windows":
-            # A static libav* pulls these in itself; with the shared build they
-            # were resolved inside the DLL.
-            self.cpp_info.system_libs = [
-                "ws2_32", "secur32", "bcrypt", "strmiids", "ole32", "oleaut32",
-                "uuid", "shlwapi", "psapi", "user32", "gdi32", "advapi32",
-                "mfplat", "mfuuid", "vfw32",
+            avutil.system_libs = [
+                "bcrypt", "user32", "advapi32", "ole32", "oleaut32",
+                "uuid", "shlwapi", "psapi",
+            ]
+            avcodec.system_libs = [
+                "mfplat", "mfuuid", "strmiids", "ole32", "user32",
+                "gdi32", "vfw32",
+            ]
+            avformat.system_libs = [
+                "ws2_32", "secur32", "bcrypt", "shlwapi",
             ]
         else:
-            self.cpp_info.system_libs = ["m", "pthread", "dl"]
+            avutil.system_libs = ["m", "pthread", "dl"]
             if self.settings.os == "Linux":
-                self.cpp_info.exelinkflags = ["-Wl,-Bsymbolic"]
-                self.cpp_info.sharedlinkflags = ["-Wl,-Bsymbolic"]
+                avutil.exelinkflags = ["-Wl,-Bsymbolic"]
+                avutil.sharedlinkflags = ["-Wl,-Bsymbolic"]

@@ -16,9 +16,11 @@
 namespace fs = std::filesystem;
 
 // Template Method base class for all CLI tools.
-// run() parses CLI flags, serves --help / no-arg invocation, and delegates to
-// execute(). Subclasses override name(), define_options(), execute(), and
-// optionally extra_help().
+// run() parses UTF-8 CLI flags, serves --help / no-arg invocation, and
+// delegates to execute(). run_cli() acquires UTF-8 process arguments on
+// Windows (GetCommandLineW / CommandLineToArgvW) before forwarding to run().
+// Subclasses override name(), define_options(), execute(), and optionally
+// extra_help().
 class ToolApp {
 public:
     virtual ~ToolApp();
@@ -29,6 +31,7 @@ public:
     ToolApp& operator=(ToolApp&&) = delete;
 
     [[nodiscard]] int run(int argc, char* argv[]);
+    [[nodiscard]] int run_cli(int argc, char* argv[]);
 
 protected:
     ToolApp() = default;

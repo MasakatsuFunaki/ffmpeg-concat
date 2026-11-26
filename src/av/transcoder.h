@@ -24,7 +24,9 @@ struct TranscodeRequest {
     fs::path output;
 
     // Filter graph in ffmpeg textual syntax. Unconnected input pads must be
-    // named "inNv"/"inNa" for input N, and outputs "outv"/"outa".
+    // named "inNv"/"inNa" for input N, and outputs "outv" (plus optional
+    // "outa" when audio is routed through the graph). Omitting "[outa]" with
+    // audio_copy == false produces a video-only output.
     std::string filter_description;
 
     std::string video_encoder;                                       // e.g. "av1_nvenc"
@@ -38,7 +40,7 @@ struct TranscodeRequest {
     // graph. Single-input only; the graph must have no "outa" pad.
     bool audio_copy = false;
 
-    bool hwaccel_cuda = false;  // decode on the GPU where the codec allows it
+    bool hwaccel_cuda = false;  // decode on GPU; enables NVDEC->NVENC zero-copy for passthrough video
 
     [[nodiscard]] bool operator==(const TranscodeRequest&) const = default;
 };

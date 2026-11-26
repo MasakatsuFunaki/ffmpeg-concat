@@ -1,6 +1,8 @@
 #include "media/media_fs.h"
 
 #include "core/concepts.h"
+#include "core/path_util.h"
+#include "platform/time_util.h"
 
 #include <boost/log/trivial.hpp>
 
@@ -150,7 +152,7 @@ struct DatedPath {
         if (!entry.is_regular_file(entry_ec) || entry_ec) {
             continue;
         }
-        const std::string ext = core::to_lower_ascii(entry.path().extension().string());
+        const std::string ext = core::to_lower_ascii(core::to_utf8(entry.path().extension()));
         if (core::contains(exts, std::string_view{ext})) {
             const fs::path& path = entry.path();
             dated.push_back(DatedPath{path, file_date(path)});
@@ -174,7 +176,7 @@ struct DatedPath {
 }  // namespace
 
 std::time_t file_date(const fs::path& filepath) {
-    const std::string stem = filepath.stem().string();
+    const std::string stem = core::to_utf8(filepath.stem());
     if (const auto parsed = parse_embedded_timestamp(stem)) {
         return *parsed;
     }
@@ -192,12 +194,7 @@ std::time_t file_date(const fs::path& filepath) {
 std::string current_timestamp() {
     const auto now = std::chrono::system_clock::now();
     const std::time_t t = std::chrono::system_clock::to_time_t(now);
-    std::tm tm{};
-#ifdef _WIN32
-    localtime_s(&tm, &t);
-#else
-    localtime_r(&t, &tm);
-#endif
+    const std::tm tm = platform::local_time(t).value_or(std::tm{});
     return std::format("{:04}-{:02}-{:02}_{:02}-{:02}-{:02}",
                        tm.tm_year + kTmYearBase,
                        tm.tm_mon + kTmMonthOffset,
@@ -220,7 +217,7 @@ void log_output_size(const fs::path& output_file) {
     std::error_code ec;
     const auto size = fs::file_size(output_file, ec);
     const double size_mb = ec ? 0.0 : static_cast<double>(size) / kBytesPerMiB;
-    BOOST_LOG_TRIVIAL(info) << "Success! Output saved to: " << output_file;
+    BOOST_LOG_TRIVIAL(info) << "Success! Output saved to: " << core::to_utf8(output_file);
     BOOST_LOG_TRIVIAL(info) << std::format("Output file size: {:.2f} MB", size_mb);
 }
 

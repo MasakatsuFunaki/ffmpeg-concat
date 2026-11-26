@@ -4,6 +4,8 @@
 #include "extract/frame_extractor.h"
 #include "extract/striking_frame_extractor.h"
 #include "extract/text_crop_extractor.h"
+#include "core/path_util.h"
+#include "core/profiler.h"
 
 #include <cstddef>
 #include <format>
@@ -37,6 +39,7 @@ void ExtractApp::define_options(po::options_description& desc) {
         ("mosaic",     po::value<std::vector<int>>()->multitoken(),   "Create mosaic of N time-distributed striking photos (requires --image-detect).\n"
                                                                               "  Usage: --mosaic <N> [P]  where P = 1-indexed start position among striking frames (default: 1)")
         ("extract-text", "Extract unique text crops from frames (Latin/Western text)")
+        ("profile",    "Print per-stage profiling summary after extraction")
     ;
 }
 
@@ -57,6 +60,7 @@ int ExtractApp::execute(const po::variables_map& vm) {
     const bool do_detect = vm.count("image-detect") > 0;
     const bool do_text = vm.count("extract-text") > 0;
     const bool do_mosaic = vm.count("mosaic") > 0;
+    const bool do_profile = vm.count("profile") > 0;
     const int num_samples = do_image ? vm["image"].as<int>() : 0;
 
     std::optional<MosaicSpec> mosaic;
@@ -104,11 +108,14 @@ int ExtractApp::execute(const po::variables_map& vm) {
         return 1;
     }
 
-    const fs::path input_path = fs::absolute(vm["input"].as<std::string>());
-    const fs::path output_dir = fs::absolute(vm["output"].as<std::string>());
+    const fs::path input_path =
+        fs::absolute(core::from_utf8(vm["input"].as<std::string>()));
+    const fs::path output_dir =
+        fs::absolute(core::from_utf8(vm["output"].as<std::string>()));
 
     if (!fs::exists(input_path)) {
-        BOOST_LOG_TRIVIAL(error) << "Error: Input path does not exist: " << input_path;
+        BOOST_LOG_TRIVIAL(error)
+            << "Error: Input path does not exist: " << core::to_utf8(input_path);
         return 1;
     }
 
@@ -119,12 +126,13 @@ int ExtractApp::execute(const po::variables_map& vm) {
         video_files = FFmpegUtils::collect_video_files(input_path);
     } else {
         BOOST_LOG_TRIVIAL(error)
-            << "Error: Input is neither a file nor a directory: " << input_path;
+            << "Error: Input is neither a file nor a directory: " << core::to_utf8(input_path);
         return 1;
     }
 
     if (video_files.empty()) {
-        BOOST_LOG_TRIVIAL(error) << "Error: No video files found in " << input_path;
+        BOOST_LOG_TRIVIAL(error)
+            << "Error: No video files found in " << core::to_utf8(input_path);
         return 1;
     }
 
@@ -132,7 +140,7 @@ int ExtractApp::execute(const po::variables_map& vm) {
 
     BOOST_LOG_TRIVIAL(info) << std::format("Found {} video file(s):", video_files.size());
     for (const auto& f : video_files) {
-        BOOST_LOG_TRIVIAL(info) << "  - " << f.filename().string();
+        BOOST_LOG_TRIVIAL(info) << "  - " << core::to_utf8(f.filename());
     }
 
     // Build extraction strategies in mode order: image -> striking -> text.
@@ -148,6 +156,12 @@ int ExtractApp::execute(const po::variables_map& vm) {
         extractors.push_back(std::make_unique<TextCropExtractor>());
     }
 
+    std::optional<core::ScopedProfilerEnable> profile_guard;
+    if (do_profile) {
+        core::Profiler::global().reset();
+        profile_guard.emplace(core::Profiler::global(), true);
+    }
+
     const Ffmpeg runner;
     bool all_ok = true;
 
@@ -156,7 +170,7 @@ int ExtractApp::execute(const po::variables_map& vm) {
         fs::create_directories(video_out_dir);
 
         BOOST_LOG_TRIVIAL(info) << std::format(
-            "=== Processing: {} ===", video.filename().string());
+            "=== Processing: {} ===", core::to_utf8(video.filename()));
 
         // Execute every mode without short-circuiting earlier failures.
         for (const auto& ex : extractors) {
@@ -166,11 +180,17 @@ int ExtractApp::execute(const po::variables_map& vm) {
         }
     }
 
+    if (do_profile) {
+        BOOST_LOG_TRIVIAL(info) << "\n=== Extraction Profile ===\n"
+                                << core::Profiler::global().format_summary();
+    }
+
+    const std::string output_utf8 = core::to_utf8(output_dir);
     if (all_ok) {
-        BOOST_LOG_TRIVIAL(info) << "Success! All frames extracted to: " << output_dir;
+        BOOST_LOG_TRIVIAL(info) << "Success! All frames extracted to: " << output_utf8;
     } else {
         BOOST_LOG_TRIVIAL(info)
-            << "Completed with some warnings. Check output in: " << output_dir;
+            << "Completed with some warnings. Check output in: " << output_utf8;
     }
 
     return all_ok ? 0 : 1;
@@ -179,6 +199,6 @@ int ExtractApp::execute(const po::variables_map& vm) {
 #ifndef TESTING_NO_MAIN
 int main(int argc, char* argv[]) {
     ExtractApp app;
-    return app.run(argc, argv);
+    return app.run_cli(argc, argv);
 }
 #endif

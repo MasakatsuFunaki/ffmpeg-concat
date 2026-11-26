@@ -17,27 +17,27 @@ endif()
 
 # Static libraries for component testing (compile app sources without main)
 add_library(concat_lib STATIC ${PROJECT_SOURCE_DIR}/src/concat/concat.cpp)
-target_link_libraries(concat_lib PUBLIC common Boost::program_options Boost::filesystem)
+target_link_libraries(concat_lib PUBLIC common Boost::program_options)
 target_compile_definitions(concat_lib PRIVATE ${PLATFORM_DEFS} TESTING_NO_MAIN)
 ffmpeg_tools_set_warnings(concat_lib)
 
 add_library(transcode_lib STATIC ${PROJECT_SOURCE_DIR}/src/transcode/transcode.cpp)
-target_link_libraries(transcode_lib PUBLIC encode common Boost::program_options Boost::filesystem)
+target_link_libraries(transcode_lib PUBLIC encode common Boost::program_options)
 target_compile_definitions(transcode_lib PRIVATE ${PLATFORM_DEFS} TESTING_NO_MAIN)
 ffmpeg_tools_set_warnings(transcode_lib)
 
 add_library(cut_lib STATIC ${PROJECT_SOURCE_DIR}/src/cut/cut.cpp)
-target_link_libraries(cut_lib PUBLIC common Boost::program_options Boost::filesystem)
+target_link_libraries(cut_lib PUBLIC common Boost::program_options)
 target_compile_definitions(cut_lib PRIVATE ${PLATFORM_DEFS} TESTING_NO_MAIN)
 ffmpeg_tools_set_warnings(cut_lib)
 
 add_library(split_lib STATIC ${PROJECT_SOURCE_DIR}/src/split/split.cpp)
-target_link_libraries(split_lib PUBLIC common Boost::program_options Boost::filesystem)
+target_link_libraries(split_lib PUBLIC common Boost::program_options)
 target_compile_definitions(split_lib PRIVATE ${PLATFORM_DEFS} TESTING_NO_MAIN)
 ffmpeg_tools_set_warnings(split_lib)
 
 add_library(extract_lib STATIC ${PROJECT_SOURCE_DIR}/src/extract/extract.cpp)
-target_link_libraries(extract_lib PUBLIC extractcore common Boost::program_options Boost::filesystem ${TEST_OPENCV_LIBS} OpenSSL::Crypto)
+target_link_libraries(extract_lib PUBLIC extractcore common Boost::program_options ${TEST_OPENCV_LIBS} OpenSSL::Crypto)
 target_compile_definitions(extract_lib PRIVATE ${PLATFORM_DEFS} TESTING_NO_MAIN)
 ffmpeg_tools_set_warnings(extract_lib)
 

@@ -2,6 +2,7 @@
 
 #include "av/av_error.h"
 #include "av/av_handles.h"
+#include "core/path_util.h"
 #include "core/scoped_handle.h"
 
 #include <boost/log/trivial.hpp>
@@ -26,17 +27,17 @@ MediaInfo probe(const fs::path& file) {
     try {
         MediaInfo info;
 
-        const std::string path_str = file.string();
+        const std::string path_str = core::to_utf8(file);
         detail::FormatInputPtr fmt;
         int rc = avformat_open_input(core::out_ptr(fmt), path_str.c_str(), nullptr, nullptr);
         if (rc < 0) {
-            BOOST_LOG_TRIVIAL(debug) << "Probe could not open " << file << ": " << err_str(rc);
+            BOOST_LOG_TRIVIAL(debug) << "Probe could not open " << path_str << ": " << err_str(rc);
             return info;
         }
 
         rc = avformat_find_stream_info(fmt.get(), nullptr);
         if (rc < 0) {
-            BOOST_LOG_TRIVIAL(debug) << "Probe found no stream info in " << file << ": "
+            BOOST_LOG_TRIVIAL(debug) << "Probe found no stream info in " << path_str << ": "
                                      << err_str(rc);
             return info;
         }
@@ -83,7 +84,7 @@ MediaInfo probe(const fs::path& file) {
 
         return info;
     } catch (const std::exception& e) {
-        BOOST_LOG_TRIVIAL(debug) << "Probe failed for " << file << ": " << e.what();
+        BOOST_LOG_TRIVIAL(debug) << "Probe failed for " << core::to_utf8(file) << ": " << e.what();
         return {};
     } catch (...) {
         return {};

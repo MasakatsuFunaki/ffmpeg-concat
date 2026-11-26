@@ -1,7 +1,9 @@
 #include "cut.h"
 
+#include "av/media_probe.h"
 #include "av/transcoder.h"
 #include "core/format_util.h"
+#include "core/path_util.h"
 #include "core/scoped_handle.h"
 #include "ffmpeg/progress_reporter.h"
 
@@ -53,7 +55,7 @@ std::string CutApp::extra_help() const {
 }
 
 int CutApp::execute(const po::variables_map& vm) {
-    const fs::path input_file   = fs::absolute(vm["input"].as<std::string>());
+    const fs::path input_file   = fs::absolute(core::from_utf8(vm["input"].as<std::string>()));
     const auto starts           = vm["start"].as<std::vector<double>>();
     const auto ends             = vm["end"].as<std::vector<double>>();
     const bool use_blur         = vm.count("blur") > 0;
@@ -74,7 +76,7 @@ int CutApp::execute(const po::variables_map& vm) {
     }
 
     if (!fs::exists(input_file) || !fs::is_regular_file(input_file)) {
-        BOOST_LOG_TRIVIAL(error) << "Error: Input file does not exist: " << input_file;
+        BOOST_LOG_TRIVIAL(error) << "Error: Input file does not exist: " << core::to_utf8(input_file);
         return 1;
     }
 
@@ -106,16 +108,16 @@ int CutApp::execute(const po::variables_map& vm) {
     fs::path output_file;
     if (out_str.empty()) {
         const fs::path parent        = input_file.parent_path();
-        const std::string stem       = input_file.stem().string();
-        const std::string ext        = input_file.extension().string();
+        const std::string stem       = core::to_utf8(input_file.stem());
+        const std::string ext        = core::to_utf8(input_file.extension());
         const std::string_view tag   = use_blur ? "_blur_" : "_cut_";
         const std::string timestamp  = media::current_timestamp();
-        output_file = parent / std::format("{}{}{}{}", stem, tag, timestamp, ext);
+        output_file = parent / core::from_utf8(std::format("{}{}{}{}", stem, tag, timestamp, ext));
         for (std::size_t n = 1; fs::exists(output_file); ++n) {
-            output_file = parent / std::format("{}{}{}_{}{}", stem, tag, timestamp, n, ext);
+            output_file = parent / core::from_utf8(std::format("{}{}{}_{}{}", stem, tag, timestamp, n, ext));
         }
     } else {
-        output_file = fs::absolute(out_str);
+        output_file = fs::absolute(core::from_utf8(out_str));
     }
 
     const std::string interval_list = core::join(
@@ -318,8 +320,14 @@ bool CutApp::run_blur(const fs::path& input_file,
         "[a][px]overlay=0:0:{0}",
         enable, block);
 
+    const bool has_audio = av::probe(input_file).has_audio;
+    const bool mute_audio = sound_off && has_audio;
+    if (sound_off && !has_audio) {
+        BOOST_LOG_TRIVIAL(info) << "Input has no audio stream; ignoring --sound-off.";
+    }
+
     std::string filter_description = std::format("[in0v]{}[outv]", video_chain);
-    if (sound_off) {
+    if (mute_audio) {
         // Muting is a filter, so audio must be decoded and re-encoded.
         filter_description += std::format(";[in0a]volume=0:{}[outa]", enable);
     }
@@ -330,7 +338,7 @@ bool CutApp::run_blur(const fs::path& input_file,
         .filter_description = std::move(filter_description),
         .video_encoder = "libx264",
         .video_options = {},
-        .audio_copy = !sound_off,
+        .audio_copy = has_audio && !sound_off,
     };
 
     BOOST_LOG_TRIVIAL(info) << "Filter graph: " << req.filter_description;
@@ -342,6 +350,6 @@ bool CutApp::run_blur(const fs::path& input_file,
 #ifndef TESTING_NO_MAIN
 int main(int argc, char* argv[]) {
     CutApp app;
-    return app.run(argc, argv);
+    return app.run_cli(argc, argv);
 }
 #endif

@@ -1,6 +1,7 @@
 #include "extract/fingerprint_cache.h"
 
 #include "core/format_util.h"
+#include "core/path_util.h"
 #include "core/scoped_handle.h"
 
 #include <algorithm>
@@ -21,7 +22,7 @@ namespace {
 
 using EvpMdCtxPtr = core::UniqueHandle<EVP_MD_CTX, EVP_MD_CTX_free>;
 
-constexpr std::size_t kReadBufferBytes = 8192;
+constexpr std::size_t kReadBufferBytes = 65536;
 constexpr std::string_view kHexDigits = "0123456789abcdef";
 constexpr unsigned int kHighNibbleShift = 4;
 constexpr unsigned int kNibbleMask = 0x0FU;
@@ -100,7 +101,7 @@ std::string FingerprintCache::compute_dir_fingerprint(const fs::path& dir,
         if (entry.path().extension() != kJpgExtension) {
             continue;
         }
-        const std::string fname = entry.path().filename().string();
+        const std::string fname = core::to_utf8(entry.path().filename());
         if (!prefix.empty() && !fname.starts_with(prefix)) {
             continue;
         }

@@ -2,6 +2,7 @@
 
 #include "av/av_error.h"
 #include "av/av_handles.h"
+#include "core/path_util.h"
 #include "core/scoped_handle.h"
 
 #include <boost/log/trivial.hpp>
@@ -40,17 +41,17 @@ struct Resources {
                                const fs::path& out_image,
                                const AVFrame* frame,
                                bool& created_output) {
-    const std::string out_path_str = out_image.string();
+    const std::string out_path_str = core::to_utf8(out_image);
     int rc = avformat_alloc_output_context2(
         core::out_ptr(res.out), nullptr, nullptr, out_path_str.c_str());
     if (rc < 0 || !res.out) {
-        BOOST_LOG_TRIVIAL(error) << "No image muxer for " << out_image << ": " << err_str(rc);
+        BOOST_LOG_TRIVIAL(error) << "No image muxer for " << out_path_str << ": " << err_str(rc);
         return false;
     }
 
     const AVCodec* codec = avcodec_find_encoder(res.out->oformat->video_codec);
     if (!codec) {
-        BOOST_LOG_TRIVIAL(error) << "No encoder for " << out_image.extension();
+        BOOST_LOG_TRIVIAL(error) << "No encoder for " << core::to_utf8(out_image.extension());
         return false;
     }
 
@@ -115,7 +116,7 @@ struct Resources {
     if (!(res.out->oformat->flags & AVFMT_NOFILE)) {
         rc = avio_open(&res.out->pb, out_path_str.c_str(), AVIO_FLAG_WRITE);
         if (rc < 0) {
-            BOOST_LOG_TRIVIAL(error) << "Could not create " << out_image << ": " << err_str(rc);
+            BOOST_LOG_TRIVIAL(error) << "Could not create " << out_path_str << ": " << err_str(rc);
             return false;
         }
         created_output = true;
@@ -171,10 +172,10 @@ bool grab_frame(const fs::path& in_path, const fs::path& out_image, double times
 
         Resources res;
 
-        const std::string in_path_str = in_path.string();
+        const std::string in_path_str = core::to_utf8(in_path);
         int rc = avformat_open_input(core::out_ptr(res.in), in_path_str.c_str(), nullptr, nullptr);
         if (rc < 0) {
-            BOOST_LOG_TRIVIAL(error) << "Could not open " << in_path << ": " << err_str(rc);
+            BOOST_LOG_TRIVIAL(error) << "Could not open " << in_path_str << ": " << err_str(rc);
             return false;
         }
         rc = avformat_find_stream_info(res.in.get(), nullptr);
@@ -185,7 +186,7 @@ bool grab_frame(const fs::path& in_path, const fs::path& out_image, double times
         const int index = av_find_best_stream(
             res.in.get(), AVMEDIA_TYPE_VIDEO, kAutoStreamIndex, kAutoStreamIndex, nullptr, 0);
         if (index < 0) {
-            BOOST_LOG_TRIVIAL(error) << in_path << " has no video stream.";
+            BOOST_LOG_TRIVIAL(error) << in_path_str << " has no video stream.";
             return false;
         }
         const AVStream* stream = res.in->streams[index];

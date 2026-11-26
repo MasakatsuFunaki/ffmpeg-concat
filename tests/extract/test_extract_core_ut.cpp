@@ -16,10 +16,13 @@
 #include <cstddef>
 #include <cstdint>
 #include <filesystem>
+#include <fstream>
 #include <ranges>
 #include <span>
 #include <string>
 #include <string_view>
+#include <type_traits>
+#include <utility>
 #include <vector>
 
 namespace fs = std::filesystem;
@@ -108,7 +111,31 @@ constexpr int kJpegQuality = 95;
 }
 
 [[nodiscard]] bool write_jpeg(const fs::path& path, const cv::Mat& img) {
-    return cv::imwrite(path.string(), img, {cv::IMWRITE_JPEG_QUALITY, kJpegQuality});
+    std::vector<std::uint8_t> buf;
+    if (!cv::imencode(".jpg", img, buf, {cv::IMWRITE_JPEG_QUALITY, kJpegQuality})) {
+        return false;
+    }
+    std::ofstream out(path, std::ios::binary | std::ios::trunc);
+    if (!out) {
+        return false;
+    }
+    out.write(reinterpret_cast<const char*>(buf.data()),
+              static_cast<std::streamsize>(buf.size()));
+    out.flush();
+    return static_cast<bool>(out);
+}
+
+[[nodiscard]] cv::Mat read_jpeg_bgr(const fs::path& path) {
+    const auto bytes = test_support::read_file_bytes(path);
+    if (bytes.empty()) {
+        return {};
+    }
+    std::vector<std::uint8_t> encoded;
+    encoded.reserve(bytes.size());
+    for (const std::byte b : bytes) {
+        encoded.push_back(std::to_integer<std::uint8_t>(b));
+    }
+    return cv::imdecode(encoded, cv::IMREAD_COLOR);
 }
 
 template <typename Pred>
@@ -401,12 +428,142 @@ TEST(CropDeduplicatorTest, HandlesEmptyMultiItemResizeThresholdAndChannelCount) 
     EXPECT_TRUE(strict.is_unique(blended, {half_h}));
 }
 
+TEST(CropDeduplicatorTest, CachedThumbnailApiMatchesStatelessDecisionsAndLifecycle) {
+    static_assert(!std::is_copy_constructible_v<CropDeduplicator>);
+    static_assert(!std::is_copy_assignable_v<CropDeduplicator>);
+    static_assert(std::is_move_constructible_v<CropDeduplicator>);
+    static_assert(std::is_move_assignable_v<CropDeduplicator>);
+
+    constexpr double kDefaultThreshold = 0.85;
+    constexpr double kLooseThreshold = 0.50;
+    constexpr double kStrictThreshold = 0.999;
+    constexpr int kCropHeight = 80;
+    constexpr int kCropWidth = 120;
+    constexpr int kDoubleWidth = 240;
+    constexpr int kDoubleHeight = 160;
+    constexpr int kSeamSide = 64;
+    constexpr int kHalfSide = 32;
+
+    const cv::Mat h_bgr = make_stripe_pattern(kCropHeight, kCropWidth, true, 3);
+    const cv::Mat v_bgr = make_stripe_pattern(kCropHeight, kCropWidth, false, 3);
+    const cv::Mat diag_bgr = make_diagonal_checker(kCropHeight, kCropWidth);
+    const cv::Mat h_gray = make_stripe_pattern(kCropHeight, kCropWidth, true, 1);
+    const cv::Mat h_bgra = make_stripe_pattern(kCropHeight, kCropWidth, true, 4);
+    cv::Mat h_double;
+    cv::resize(h_bgr, h_double, cv::Size(kDoubleWidth, kDoubleHeight), 0.0, 0.0, cv::INTER_NEAREST);
+
+    CropDeduplicator cached(kDefaultThreshold);
+    const CropDeduplicator stateless(kDefaultThreshold);
+    std::vector<cv::Mat> saved_reference;
+
+    EXPECT_EQ(cached.cached_count(), 0u);
+    EXPECT_FALSE(cached.is_unique_against_cached(cv::Mat{}));
+    EXPECT_FALSE(cached.try_add(cv::Mat{}));
+    EXPECT_EQ(cached.cached_count(), 0u);
+
+    // Unsupported pixel depth (CV_32FC3) and channel count (2ch) must be rejected
+    // identically by stateless is_unique and cached APIs even when saved set is empty.
+    const cv::Mat float_crop(kCropHeight, kCropWidth, CV_32FC3, cv::Scalar(0.5F, 0.5F, 0.5F));
+    const cv::Mat two_ch_crop(kCropHeight, kCropWidth, CV_8UC2, cv::Scalar(64, 192));
+    const std::span<const cv::Mat> empty_saved{};
+    EXPECT_FALSE(stateless.is_unique(float_crop, empty_saved));
+    EXPECT_FALSE(cached.is_unique_against_cached(float_crop));
+    EXPECT_FALSE(cached.try_add(float_crop));
+    EXPECT_FALSE(stateless.is_unique(two_ch_crop, empty_saved));
+    EXPECT_FALSE(cached.is_unique_against_cached(two_ch_crop));
+    EXPECT_FALSE(cached.try_add(two_ch_crop));
+    EXPECT_EQ(cached.cached_count(), 0u);
+
+    // Non-mutating check must leave cache empty.
+    EXPECT_TRUE(cached.is_unique_against_cached(h_bgr));
+    EXPECT_EQ(cached.cached_count(), 0u);
+
+    // Verify step-by-step decision parity across 1ch/3ch/4ch, resize, empty seam, and multi-item sets.
+    struct SequenceStep {
+        std::string_view label;
+        cv::Mat crop;
+        bool expected_unique;
+    };
+    const std::array<SequenceStep, 10> steps{{
+        {"first_horizontal_bgr", h_bgr, true},
+        {"dup_horizontal_bgr", h_bgr.clone(), false},
+        {"dup_horizontal_gray_1ch", h_gray, false},
+        {"dup_horizontal_bgra_4ch", h_bgra, false},
+        {"dup_horizontal_resized_2x", h_double, false},
+        {"empty_mid_session_seam", cv::Mat{}, false},
+        {"distinct_vertical_bgr", v_bgr, true},
+        {"distinct_diagonal_bgr", diag_bgr, true},
+        {"dup_middle_element_vertical", v_bgr.clone(), false},
+        {"dup_diagonal_clone", diag_bgr.clone(), false},
+    }};
+
+    for (const auto& step : steps) {
+        SCOPED_TRACE(step.label);
+        const bool stateless_unique =
+            stateless.is_unique(step.crop, std::span<const cv::Mat>{saved_reference});
+        const bool cached_peek = cached.is_unique_against_cached(step.crop);
+        EXPECT_EQ(stateless_unique, step.expected_unique);
+        EXPECT_EQ(cached_peek, stateless_unique);
+
+        const std::size_t count_before = cached.cached_count();
+        const bool added = cached.try_add(step.crop);
+        EXPECT_EQ(added, stateless_unique);
+        if (added) {
+            saved_reference.push_back(step.crop);
+            EXPECT_EQ(cached.cached_count(), count_before + 1u);
+        } else {
+            EXPECT_EQ(cached.cached_count(), count_before);
+        }
+    }
+    EXPECT_EQ(cached.cached_count(), saved_reference.size());
+
+    // Move preserves cached thumbnails and deduplication decisions.
+    CropDeduplicator moved_ctor(std::move(cached));
+    EXPECT_EQ(moved_ctor.cached_count(), saved_reference.size());
+    EXPECT_FALSE(moved_ctor.is_unique_against_cached(h_bgr));
+    EXPECT_FALSE(moved_ctor.try_add(v_bgr.clone()));
+    EXPECT_EQ(moved_ctor.cached_count(), saved_reference.size());
+
+    CropDeduplicator moved_assign(kLooseThreshold);
+    moved_assign = std::move(moved_ctor);
+    EXPECT_EQ(moved_assign.cached_count(), saved_reference.size());
+    EXPECT_FALSE(moved_assign.is_unique_against_cached(diag_bgr));
+
+    // clear_cache() empties stored thumbnails while preserving threshold.
+    moved_assign.clear_cache();
+    EXPECT_EQ(moved_assign.cached_count(), 0u);
+    EXPECT_TRUE(moved_assign.is_unique_against_cached(h_bgr));
+    EXPECT_TRUE(moved_assign.try_add(h_bgr));
+    EXPECT_EQ(moved_assign.cached_count(), 1u);
+    EXPECT_FALSE(moved_assign.try_add(h_bgr.clone()));
+
+    // Threshold seam parity: 50/50 blend of orthogonal half-splits strictly in (0.50, 0.999).
+    cv::Mat half_h(kSeamSide, kSeamSide, CV_8UC3, cv::Scalar(0, 0, 0));
+    half_h(cv::Rect(0, kHalfSide, kSeamSide, kHalfSide)).setTo(cv::Scalar(255, 255, 255));
+    cv::Mat half_v(kSeamSide, kSeamSide, CV_8UC3, cv::Scalar(0, 0, 0));
+    half_v(cv::Rect(kHalfSide, 0, kHalfSide, kSeamSide)).setTo(cv::Scalar(255, 255, 255));
+    cv::Mat blended;
+    cv::addWeighted(half_h, 0.5, half_v, 0.5, 0.0, blended);
+
+    CropDeduplicator loose(kLooseThreshold);
+    CropDeduplicator strict(kStrictThreshold);
+    ASSERT_TRUE(loose.try_add(half_h));
+    ASSERT_TRUE(strict.try_add(half_h));
+    EXPECT_EQ(loose.is_unique_against_cached(blended), loose.is_unique(blended, {half_h}));
+    EXPECT_EQ(strict.is_unique_against_cached(blended), strict.is_unique(blended, {half_h}));
+    EXPECT_FALSE(loose.try_add(blended));
+    EXPECT_TRUE(strict.try_add(blended));
+    EXPECT_EQ(loose.cached_count(), 1u);
+    EXPECT_EQ(strict.cached_count(), 2u);
+}
+
 // FrameScorer
 
 TEST(FrameScorerTest, RejectsInvalidFilesAndRanksSharpAboveFlatAndBlurred) {
     test_support::ScopedTempDir sandbox("ut_frame_scorer");
     const FrameScorer scorer;
 
+    EXPECT_DOUBLE_EQ(scorer.score(cv::Mat{}), 0.0);
     EXPECT_DOUBLE_EQ(scorer.score(sandbox.child("missing.jpg")), 0.0);
     EXPECT_DOUBLE_EQ(scorer.score(sandbox.write_bytes("empty.jpg", {})), 0.0);
     EXPECT_DOUBLE_EQ(scorer.score(sandbox.write_text("corrupt.jpg", "not_a_jpeg")), 0.0);
@@ -416,6 +573,14 @@ TEST(FrameScorerTest, RejectsInvalidFilesAndRanksSharpAboveFlatAndBlurred) {
     const cv::Mat sharp = make_vibrant_checkerboard(kImgSide, 8);
     cv::Mat blurred;
     cv::GaussianBlur(sharp, blurred, cv::Size(21, 21), 8.0);
+
+    // In-memory cv::Mat overload ranks sharp above flat and blurred.
+    const double mem_flat = scorer.score(flat);
+    const double mem_sharp = scorer.score(sharp);
+    const double mem_blurred = scorer.score(blurred);
+    EXPECT_GT(mem_sharp, 0.0);
+    EXPECT_GT(mem_sharp, mem_flat);
+    EXPECT_GT(mem_sharp, mem_blurred);
 
     const fs::path flat_path = sandbox.child("flat.jpg");
     const fs::path sharp_path = sandbox.child("sharp.jpg");
@@ -431,6 +596,17 @@ TEST(FrameScorerTest, RejectsInvalidFilesAndRanksSharpAboveFlatAndBlurred) {
     EXPECT_GT(score_sharp, 0.0);
     EXPECT_GT(score_sharp, score_flat);
     EXPECT_GT(score_sharp, score_blurred);
+
+    // Unicode path disk read matches in-memory score of the exact decoded JPEG bytes.
+    constexpr double kScoreParityTolerance = 1e-9;
+    const fs::path unicode_dir = sandbox.create_subdir(u8"scorer_café_動画");
+    const fs::path unicode_sharp = unicode_dir / test_support::path_from_u8(u8"café_動画_sharp.jpg");
+    ASSERT_TRUE(write_jpeg(unicode_sharp, sharp));
+    const cv::Mat decoded_sharp = read_jpeg_bgr(unicode_sharp);
+    ASSERT_FALSE(decoded_sharp.empty());
+    EXPECT_NEAR(scorer.score(unicode_sharp), scorer.score(decoded_sharp), kScoreParityTolerance);
+    EXPECT_DOUBLE_EQ(scorer.score(unicode_dir / test_support::path_from_u8(u8"missing_動画.jpg")),
+                     0.0);
 }
 
 // MosaicBuilder

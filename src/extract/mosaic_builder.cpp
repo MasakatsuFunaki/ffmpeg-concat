@@ -1,6 +1,10 @@
 #include "extract/mosaic_builder.h"
 
 #include "extract/fingerprint_cache.h"
+#include "extract/image_io.h"
+#include "core/path_util.h"
+#include "core/profiler.h"
+#include "core/thread_pool.h"
 
 #include <algorithm>
 #include <cmath>
@@ -10,19 +14,20 @@
 #include <span>
 #include <string>
 #include <string_view>
+#include <system_error>
 #include <utility>
 #include <vector>
 
 #include <boost/log/trivial.hpp>
 
 #include <opencv2/core.hpp>
-#include <opencv2/imgcodecs.hpp>
 #include <opencv2/imgproc.hpp>
 
 namespace {
 
 constexpr int kMinMosaicCount = 1;
 constexpr int kMinMosaicStart = 1;
+constexpr int kParallelDecodeThreshold = 4;
 constexpr int kCanvasWidth = 1920;
 constexpr int kCanvasHeight = 1080;
 constexpr std::string_view kStrikingPrefix = "striking_";
@@ -34,6 +39,8 @@ bool MosaicBuilder::build(const fs::path& detect_dir,
                           const fs::path& mosaic_dir,
                           int mosaic_count,
                           int mosaic_start) const {
+    core::ScopedProfile prof("extract.mosaic.build");
+
     std::error_code ec;
     if (mosaic_count < kMinMosaicCount || mosaic_start < kMinMosaicStart ||
         !fs::exists(detect_dir, ec) || !fs::is_directory(detect_dir, ec)) {
@@ -67,7 +74,7 @@ bool MosaicBuilder::build(const fs::path& detect_dir,
     for (const auto& entry : dir_it) {
         if (entry.is_regular_file() &&
             entry.path().extension() == kJpgExtension &&
-            entry.path().filename().string().starts_with(kStrikingPrefix)) {
+            core::to_utf8(entry.path().filename()).starts_with(kStrikingPrefix)) {
             striking_files.push_back(entry.path());
         }
     }
@@ -97,15 +104,34 @@ bool MosaicBuilder::build(const fs::path& detect_dir,
         return false;
     }
 
-    std::vector<cv::Mat> images;
-    images.reserve(static_cast<std::size_t>(mosaic_count));
+    std::vector<fs::path> selected_paths;
+    selected_paths.reserve(static_cast<std::size_t>(mosaic_count));
     for (const int i : std::views::iota(0, mosaic_count)) {
         int idx = (mosaic_count == 1)
                       ? 0
                       : static_cast<int>(std::round(
                             static_cast<double>(i) * (available - 1) / (mosaic_count - 1)));
         idx = std::min(idx, available - 1);
-        cv::Mat img = cv::imread(subset[static_cast<std::size_t>(idx)].string());
+        selected_paths.push_back(subset[static_cast<std::size_t>(idx)]);
+    }
+
+    std::vector<cv::Mat> decoded(selected_paths.size());
+    if (mosaic_count >= kParallelDecodeThreshold) {
+        const std::size_t worker_count =
+            std::min(selected_paths.size(), core::ThreadPool::default_thread_count());
+        core::ThreadPool pool(worker_count);
+        pool.parallel_for(selected_paths.size(), [&selected_paths, &decoded](std::size_t i) {
+            decoded[i] = extract_io::read_image(selected_paths[i]);
+        });
+    } else {
+        for (const std::size_t i : std::views::iota(std::size_t{0}, selected_paths.size())) {
+            decoded[i] = extract_io::read_image(selected_paths[i]);
+        }
+    }
+
+    std::vector<cv::Mat> images;
+    images.reserve(decoded.size());
+    for (auto& img : decoded) {
         if (!img.empty()) {
             images.push_back(std::move(img));
         }
@@ -142,14 +168,14 @@ bool MosaicBuilder::build(const fs::path& detect_dir,
     }
 
     fs::create_directories(mosaic_dir);
-    const std::string output_path = mosaic_file.string();
-    if (!cv::imwrite(output_path, canvas)) {
-        BOOST_LOG_TRIVIAL(warning) << "  Failed to write mosaic to " << output_path;
+    const std::string output_utf8 = core::to_utf8(mosaic_file);
+    if (!extract_io::write_jpeg(mosaic_file, canvas)) {
+        BOOST_LOG_TRIVIAL(warning) << "  Failed to write mosaic to " << output_utf8;
         return false;
     }
 
     BOOST_LOG_TRIVIAL(info) << std::format(
-        "  Created mosaic ({} images) at {}", actual_n, output_path);
+        "  Created mosaic ({} images) at {}", actual_n, output_utf8);
     FingerprintCache::save(hash_file, current_fp);
     return true;
 }

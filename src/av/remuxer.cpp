@@ -3,6 +3,7 @@
 #include "av/av_error.h"
 #include "av/av_handles.h"
 #include "core/format_util.h"
+#include "core/path_util.h"
 #include "core/scoped_handle.h"
 #include "ffmpeg/progress_reporter.h"
 
@@ -13,7 +14,9 @@
 #include <cstddef>
 #include <cstdint>
 #include <exception>
+#include <format>
 #include <ranges>
+#include <span>
 #include <string>
 #include <system_error>
 #include <utility>
@@ -28,6 +31,7 @@ namespace av {
 namespace {
 
 constexpr int kUnmappedStream = -1;
+constexpr int kAutoStreamIndex = -1;
 constexpr int kSeekAllStreams = -1;
 constexpr std::int64_t kUnknownPacketPos = -1;
 constexpr std::int64_t kMinDtsStep = 1;
@@ -36,6 +40,104 @@ constexpr std::uint8_t kStreamActive = 0;
 constexpr std::uint8_t kStreamFinished = 1;
 constexpr std::chrono::milliseconds kProgressInterval{200};
 
+// Best video/audio stream selection and parameters used for concat validation
+// and per-clip packet remapping.
+struct StreamSignature {
+    int video_index = kUnmappedStream;
+    int audio_index = kUnmappedStream;
+    AVCodecID video_codec = AV_CODEC_ID_NONE;
+    int width = 0;
+    int height = 0;
+    AVCodecID audio_codec = AV_CODEC_ID_NONE;
+
+    [[nodiscard]] bool has_video() const noexcept { return video_index >= 0; }
+    [[nodiscard]] bool has_audio() const noexcept { return audio_index >= 0; }
+};
+
+[[nodiscard]] const char* codec_name(AVCodecID id) noexcept {
+    const char* name = avcodec_get_name(id);
+    return name ? name : "unknown";
+}
+
+[[nodiscard]] StreamSignature inspect_streams(AVFormatContext* fmt) noexcept {
+    StreamSignature sig;
+
+    const int vid = av_find_best_stream(
+        fmt, AVMEDIA_TYPE_VIDEO, kAutoStreamIndex, kAutoStreamIndex, nullptr, 0);
+    if (vid >= 0) {
+        sig.video_index = vid;
+        const AVCodecParameters* par = fmt->streams[vid]->codecpar;
+        sig.video_codec = par->codec_id;
+        sig.width = par->width;
+        sig.height = par->height;
+    }
+
+    const int aud = av_find_best_stream(
+        fmt, AVMEDIA_TYPE_AUDIO, kAutoStreamIndex, kAutoStreamIndex, nullptr, 0);
+    if (aud >= 0) {
+        sig.audio_index = aud;
+        sig.audio_codec = fmt->streams[aud]->codecpar->codec_id;
+    }
+
+    return sig;
+}
+
+[[nodiscard]] bool validate_clip_compatibility(std::size_t clip_index,
+                                               const fs::path& clip_path,
+                                               const StreamSignature& ref,
+                                               const StreamSignature& cur) {
+    std::vector<std::string> reasons;
+
+    if (cur.has_video() != ref.has_video()) {
+        reasons.push_back(std::format(
+            "video stream presence mismatch (clip #0 {}, clip #{} {})",
+            ref.has_video()
+                ? std::format("has video ({} {}x{})",
+                              codec_name(ref.video_codec), ref.width, ref.height)
+                : std::string{"has no video"},
+            clip_index,
+            cur.has_video()
+                ? std::format("has video ({} {}x{})",
+                              codec_name(cur.video_codec), cur.width, cur.height)
+                : std::string{"has no video"}));
+    } else if (ref.has_video()) {
+        if (cur.video_codec != ref.video_codec) {
+            reasons.push_back(std::format(
+                "video codec mismatch (clip #0 {}, clip #{} {})",
+                codec_name(ref.video_codec), clip_index, codec_name(cur.video_codec)));
+        }
+        if (cur.width != ref.width || cur.height != ref.height) {
+            reasons.push_back(std::format(
+                "video dimensions mismatch (clip #0 {}x{}, clip #{} {}x{})",
+                ref.width, ref.height, clip_index, cur.width, cur.height));
+        }
+    }
+
+    if (cur.has_audio() != ref.has_audio()) {
+        reasons.push_back(std::format(
+            "audio stream presence mismatch (clip #0 {}, clip #{} {})",
+            ref.has_audio() ? std::format("has audio ({})", codec_name(ref.audio_codec))
+                            : std::string{"has no audio"},
+            clip_index,
+            cur.has_audio() ? std::format("has audio ({})", codec_name(cur.audio_codec))
+                            : std::string{"has no audio"}));
+    } else if (ref.has_audio() && cur.audio_codec != ref.audio_codec) {
+        reasons.push_back(std::format(
+            "audio codec mismatch (clip #0 {}, clip #{} {})",
+            codec_name(ref.audio_codec), clip_index, codec_name(cur.audio_codec)));
+    }
+
+    if (reasons.empty()) {
+        return true;
+    }
+
+    BOOST_LOG_TRIVIAL(error) << "Cannot stream-copy concatenate clip #" << clip_index
+                             << " (" << core::to_utf8(clip_path) << "): "
+                             << core::join(reasons, "; ")
+                             << ". Re-encode with the transcode tool to join incompatible clips.";
+    return false;
+}
+
 // Output container paired with its source-to-output stream index map.
 class Output {
 public:
@@ -43,50 +145,34 @@ public:
     [[nodiscard]] bool open(const fs::path& path,
                             const AVFormatContext* source,
                             bool& created_output) {
-        const std::string path_str = path.string();
-        int rc = avformat_alloc_output_context2(
-            core::out_ptr(fmt_), nullptr, nullptr, path_str.c_str());
-        if (rc < 0 || !fmt_) {
-            BOOST_LOG_TRIVIAL(error) << "Could not create " << path << ": " << err_str(rc);
-            return false;
-        }
-
-        stream_map_.assign(source->nb_streams, kUnmappedStream);
+        std::vector<int> indices;
+        indices.reserve(source->nb_streams);
         for (const unsigned i : std::views::iota(0u, source->nb_streams)) {
-            const AVStream* in = source->streams[i];
-            const AVMediaType type = in->codecpar->codec_type;
-            if (type != AVMEDIA_TYPE_VIDEO && type != AVMEDIA_TYPE_AUDIO) {
-                continue;
+            const AVMediaType type = source->streams[i]->codecpar->codec_type;
+            if (type == AVMEDIA_TYPE_VIDEO || type == AVMEDIA_TYPE_AUDIO) {
+                indices.push_back(static_cast<int>(i));
             }
-
-            AVStream* out = avformat_new_stream(fmt_.get(), nullptr);
-            if (!out) {
-                return false;
-            }
-            rc = avcodec_parameters_copy(out->codecpar, in->codecpar);
-            if (rc < 0) {
-                BOOST_LOG_TRIVIAL(error) << "Could not copy stream parameters: " << err_str(rc);
-                return false;
-            }
-            out->codecpar->codec_tag = 0;  // let the muxer pick a tag it supports
-            out->time_base = in->time_base;
-            stream_map_[i] = out->index;
         }
+        return open_selected(path, source, indices, created_output);
+    }
 
-        if (!(fmt_->oformat->flags & AVFMT_NOFILE)) {
-            rc = avio_open(&fmt_->pb, path_str.c_str(), AVIO_FLAG_WRITE);
-            if (rc < 0) {
-                BOOST_LOG_TRIVIAL(error) << "Could not create " << path << ": " << err_str(rc);
-                return false;
-            }
-            created_output = true;
+    // Mirrors only the validated best video and best audio streams from `source`.
+    [[nodiscard]] bool open(const fs::path& path,
+                            const AVFormatContext* source,
+                            const StreamSignature& sig,
+                            bool& created_output) {
+        std::vector<int> indices;
+        if (sig.has_video()) {
+            indices.push_back(sig.video_index);
         }
-
-        rc = avformat_write_header(fmt_.get(), nullptr);
-        if (rc < 0) {
-            BOOST_LOG_TRIVIAL(error) << "Could not write the container header: " << err_str(rc);
+        if (sig.has_audio()) {
+            indices.push_back(sig.audio_index);
+        }
+        if (!open_selected(path, source, indices, created_output)) {
             return false;
         }
+        video_out_index_ = sig.has_video() ? mapped(sig.video_index) : kUnmappedStream;
+        audio_out_index_ = sig.has_audio() ? mapped(sig.audio_index) : kUnmappedStream;
         return true;
     }
 
@@ -106,6 +192,17 @@ public:
         return stream_map_[static_cast<std::size_t>(source_index)];
     }
 
+    // Maps a packet from any validated clip's stream indices to output stream indices.
+    [[nodiscard]] int map_for(const StreamSignature& sig, int source_index) const noexcept {
+        if (sig.has_video() && source_index == sig.video_index) {
+            return video_out_index_;
+        }
+        if (sig.has_audio() && source_index == sig.audio_index) {
+            return audio_out_index_;
+        }
+        return kUnmappedStream;
+    }
+
     [[nodiscard]] AVStream* stream(int out_index) const noexcept {
         return fmt_->streams[out_index];
     }
@@ -113,22 +210,76 @@ public:
     [[nodiscard]] AVFormatContext* ctx() const noexcept { return fmt_.get(); }
 
 private:
+    [[nodiscard]] bool open_selected(const fs::path& path,
+                                     const AVFormatContext* source,
+                                     std::span<const int> source_indices,
+                                     bool& created_output) {
+        video_out_index_ = kUnmappedStream;
+        audio_out_index_ = kUnmappedStream;
+
+        const std::string path_str = core::to_utf8(path);
+        int rc = avformat_alloc_output_context2(
+            core::out_ptr(fmt_), nullptr, nullptr, path_str.c_str());
+        if (rc < 0 || !fmt_) {
+            BOOST_LOG_TRIVIAL(error) << "Could not create " << path_str << ": " << err_str(rc);
+            return false;
+        }
+
+        stream_map_.assign(source->nb_streams, kUnmappedStream);
+        for (const int src_index : source_indices) {
+            if (src_index < 0 || std::cmp_greater_equal(src_index, source->nb_streams)) {
+                continue;
+            }
+            const AVStream* in = source->streams[src_index];
+            AVStream* out = avformat_new_stream(fmt_.get(), nullptr);
+            if (!out) {
+                return false;
+            }
+            rc = avcodec_parameters_copy(out->codecpar, in->codecpar);
+            if (rc < 0) {
+                BOOST_LOG_TRIVIAL(error) << "Could not copy stream parameters: " << err_str(rc);
+                return false;
+            }
+            out->codecpar->codec_tag = 0;  // let the muxer pick a tag it supports
+            out->time_base = in->time_base;
+            stream_map_[static_cast<std::size_t>(src_index)] = out->index;
+        }
+
+        if (!(fmt_->oformat->flags & AVFMT_NOFILE)) {
+            rc = avio_open(&fmt_->pb, path_str.c_str(), AVIO_FLAG_WRITE);
+            if (rc < 0) {
+                BOOST_LOG_TRIVIAL(error) << "Could not create " << path_str << ": " << err_str(rc);
+                return false;
+            }
+            created_output = true;
+        }
+
+        rc = avformat_write_header(fmt_.get(), nullptr);
+        if (rc < 0) {
+            BOOST_LOG_TRIVIAL(error) << "Could not write the container header: " << err_str(rc);
+            return false;
+        }
+        return true;
+    }
+
     detail::FormatOutputPtr fmt_;
     std::vector<int> stream_map_;
+    int video_out_index_ = kUnmappedStream;
+    int audio_out_index_ = kUnmappedStream;
 };
 
 class InputFile {
 public:
     [[nodiscard]] bool open(const fs::path& path) {
-        const std::string path_str = path.string();
+        const std::string path_str = core::to_utf8(path);
         int rc = avformat_open_input(core::out_ptr(fmt_), path_str.c_str(), nullptr, nullptr);
         if (rc < 0) {
-            BOOST_LOG_TRIVIAL(error) << "Could not open " << path << ": " << err_str(rc);
+            BOOST_LOG_TRIVIAL(error) << "Could not open " << path_str << ": " << err_str(rc);
             return false;
         }
         rc = avformat_find_stream_info(fmt_.get(), nullptr);
         if (rc < 0) {
-            BOOST_LOG_TRIVIAL(error) << "No stream info in " << path << ": " << err_str(rc);
+            BOOST_LOG_TRIVIAL(error) << "No stream info in " << path_str << ": " << err_str(rc);
             return false;
         }
         return true;
@@ -140,12 +291,39 @@ private:
     detail::FormatInputPtr fmt_;
 };
 
+[[nodiscard]] bool validate_concat_inputs(std::span<const fs::path> inputs,
+                                          const StreamSignature& ref) {
+    if (!ref.has_video() && !ref.has_audio()) {
+        BOOST_LOG_TRIVIAL(error) << "Cannot stream-copy concatenate: clip #0 ("
+                                 << core::to_utf8(inputs.front())
+                                 << ") has neither a video nor an audio stream.";
+        return false;
+    }
+
+    for (std::size_t i = 1; i < inputs.size(); ++i) {
+        InputFile probe;
+        if (!probe.open(inputs[i])) {
+            return false;
+        }
+        const StreamSignature cur = inspect_streams(probe.ctx());
+        if (!validate_clip_compatibility(i, inputs[i], ref, cur)) {
+            return false;
+        }
+    }
+    return true;
+}
+
 [[nodiscard]] bool run_concat_copy(std::span<const fs::path> inputs,
                                    const fs::path& out_path,
                                    ProgressReporter& reporter,
                                    double total_sec) {
     InputFile first;
     if (!first.open(inputs.front())) {
+        return false;
+    }
+
+    const StreamSignature ref = inspect_streams(first.ctx());
+    if (!validate_concat_inputs(inputs, ref)) {
         return false;
     }
 
@@ -159,7 +337,7 @@ private:
     });
 
     Output out;
-    if (!out.open(out_path, first.ctx(), created_output)) {
+    if (!out.open(out_path, first.ctx(), ref, created_output)) {
         return false;
     }
 
@@ -179,10 +357,17 @@ private:
     for (const std::size_t i : std::views::iota(std::size_t{0}, inputs.size())) {
         InputFile current;
         InputFile* source = &current;
+        StreamSignature sig = ref;
         if (i == 0) {
             source = &first;
-        } else if (!current.open(inputs[i])) {
-            return false;
+        } else {
+            if (!current.open(inputs[i])) {
+                return false;
+            }
+            sig = inspect_streams(current.ctx());
+            if (!validate_clip_compatibility(i, inputs[i], ref, sig)) {
+                return false;
+            }
         }
 
         std::vector<std::int64_t> first_ts(source->ctx()->nb_streams, AV_NOPTS_VALUE);
@@ -198,7 +383,7 @@ private:
                 return false;
             }
 
-            const int out_index = out.mapped(pkt->stream_index);
+            const int out_index = out.map_for(sig, pkt->stream_index);
             if (out_index < 0) {
                 av_packet_unref(pkt.get());
                 continue;

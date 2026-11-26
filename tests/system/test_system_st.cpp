@@ -6,6 +6,8 @@
 
 #include "av/frame_grabber.h"
 #include "av/media_probe.h"
+#include "av/transcoder.h"
+#include "ffmpeg/progress_reporter.h"
 
 #include <gtest/gtest.h>
 #include <opencv2/core.hpp>
@@ -13,7 +15,9 @@
 
 #include <algorithm>
 #include <array>
+#include <cctype>
 #include <cstddef>
+#include <cstdint>
 #include <filesystem>
 #include <format>
 #include <initializer_list>
@@ -42,6 +46,14 @@ constexpr double kSplitSumMatchTolSec = 1.0;
 constexpr double kSplitRoundTripTolSec = 2.0;
 constexpr std::size_t kExpectedSplitPartCount = 3u;
 
+constexpr double kUnicodeSplitFirstSec = 4.0;
+constexpr double kUnicodeSplitSecondSec = 10.0;
+constexpr double kUnicodeSplitPartTolSec = 2.0;
+constexpr double kUnicodeRoundTripTolSec = 2.5;
+constexpr double kUnicodeCutRemovedSec = 3.0;
+constexpr double kUnicodeCutMinShortenSec = 1.0;
+constexpr std::size_t kUnicodeInputCount = 2u;
+
 constexpr double kFrameProbeStartSec = 0.5;
 constexpr double kFrameProbeEndMarginSec = 1.0;
 
@@ -65,9 +77,26 @@ constexpr double kTranscodeExpectedDurationSec = 4.0;
 constexpr double kTranscodeDurationTolSec = 0.6;
 constexpr std::size_t kTranscodeMinInputClips = 2u;
 constexpr std::size_t kTranscodeExtractCount = 4u;
+constexpr std::size_t kSilentExtractImageCount = 3u;
+constexpr std::size_t kMismatchInputCount = 2u;
 
 constexpr int kExpectedSuccessExitCode = 0;
 constexpr int kExpectedFailureExitCode = 1;
+
+constexpr std::array<std::string_view, 2> kForbiddenTempDirNames{{
+    "_temp_candidates",
+    "_temp_text",
+}};
+
+constexpr std::array<std::string_view, 7> kStreamMismatchDiagnosticTerms{{
+    "mismatch",
+    "incompatible",
+    "codec",
+    "resolution",
+    "dimension",
+    "hevc",
+    "h264",
+}};
 
 enum class ToolId : std::size_t {
     kConcat = 0,
@@ -130,7 +159,7 @@ constexpr std::array<ToolContract, 5> kToolContracts{{
     const auto env_dir = test_support::get_env_var("FFMPEG_TOOLS_BIN_DIR");
     return std::format(
         "Required CLI executable missing for '{}' at '{}' (FFMPEG_TOOLS_BIN_DIR={})",
-        tool_name, resolved_path.string(), env_dir ? *env_dir : "<unset>");
+        tool_name, test_support::path_to_utf8(resolved_path), env_dir ? *env_dir : "<unset>");
 }
 
 [[nodiscard]] std::string_view trim_ascii(std::string_view text) noexcept {
@@ -145,6 +174,24 @@ constexpr std::array<ToolContract, 5> kToolContracts{{
 
 [[nodiscard]] constexpr bool is_hex_digit(char ch) noexcept {
     return (ch >= '0' && ch <= '9') || (ch >= 'a' && ch <= 'f') || (ch >= 'A' && ch <= 'F');
+}
+
+[[nodiscard]] bool contains_case_insensitive(std::string_view haystack, std::string_view needle) {
+    if (needle.empty()) {
+        return true;
+    }
+    const auto equal_ci = [](char a, char b) {
+        return std::tolower(static_cast<unsigned char>(a)) ==
+               std::tolower(static_cast<unsigned char>(b));
+    };
+    return !std::ranges::search(haystack, needle, equal_ci).empty();
+}
+
+[[nodiscard]] bool contains_any_case_insensitive(
+    std::string_view haystack, std::span<const std::string_view> needles) {
+    return std::ranges::any_of(needles, [haystack](std::string_view needle) {
+        return contains_case_insensitive(haystack, needle);
+    });
 }
 
 [[nodiscard]] bool is_valid_dir_fingerprint(
@@ -193,12 +240,25 @@ constexpr std::array<ToolContract, 5> kToolContracts{{
 
 [[nodiscard]] cv::Mat decode_and_verify_jpeg(
     const fs::path& jpg_path, int expected_width, int expected_height) {
-    EXPECT_TRUE(fs::is_regular_file(jpg_path)) << "Missing JPEG: " << jpg_path;
-    const cv::Mat img = cv::imread(jpg_path.string(), cv::IMREAD_COLOR);
-    EXPECT_FALSE(img.empty()) << "Failed to decode JPEG: " << jpg_path;
+    const std::string display = test_support::path_to_utf8(jpg_path);
+    EXPECT_TRUE(fs::is_regular_file(jpg_path)) << "Missing JPEG: " << display;
+    if (!fs::is_regular_file(jpg_path)) {
+        return {};
+    }
+    const std::vector<std::byte> raw = test_support::read_file_bytes(jpg_path);
+    EXPECT_FALSE(raw.empty()) << "Empty JPEG file: " << display;
+    if (raw.empty()) {
+        return {};
+    }
+    std::vector<std::uint8_t> encoded(raw.size());
+    std::ranges::transform(raw, encoded.begin(), [](std::byte b) noexcept {
+        return std::to_integer<std::uint8_t>(b);
+    });
+    const cv::Mat img = cv::imdecode(encoded, cv::IMREAD_COLOR);
+    EXPECT_FALSE(img.empty()) << "Failed to decode JPEG: " << display;
     if (!img.empty()) {
-        EXPECT_EQ(img.cols, expected_width) << "JPEG width mismatch: " << jpg_path;
-        EXPECT_EQ(img.rows, expected_height) << "JPEG height mismatch: " << jpg_path;
+        EXPECT_EQ(img.cols, expected_width) << "JPEG width mismatch: " << display;
+        EXPECT_EQ(img.rows, expected_height) << "JPEG height mismatch: " << display;
     }
     return img;
 }
@@ -206,10 +266,93 @@ constexpr std::array<ToolContract, 5> kToolContracts{{
 void verify_all_jpegs_match_dimensions(
     std::span<const fs::path> jpg_files, int expected_width, int expected_height) {
     for (const auto& jpg : jpg_files) {
-        SCOPED_TRACE(jpg.string());
+        SCOPED_TRACE(test_support::path_to_utf8(jpg));
         const cv::Mat decoded = decode_and_verify_jpeg(jpg, expected_width, expected_height);
         EXPECT_FALSE(decoded.empty());
     }
+}
+
+void verify_extract_image_detect_mosaic(
+    const fs::path& stem_dir,
+    int expected_width,
+    int expected_height,
+    std::size_t expected_image_count) {
+    const fs::path image_dir = stem_dir / "image";
+    const fs::path detect_dir = stem_dir / "detect";
+    const fs::path mosaics_dir = stem_dir / "mosaics";
+
+    EXPECT_EQ(test_support::list_all_entries(image_dir).size(), expected_image_count);
+    const auto image_files = test_support::list_regular_files(image_dir, ".jpg", "frame_");
+    ASSERT_EQ(image_files.size(), expected_image_count);
+    verify_all_jpegs_match_dimensions(image_files, expected_width, expected_height);
+
+    const auto striking_files = test_support::list_regular_files(detect_dir, ".jpg", "striking_");
+    ASSERT_GE(striking_files.size(), kExtractMosaicMinStriking);
+    ASSERT_LE(striking_files.size(), kMaxStrikingFrames);
+    verify_all_jpegs_match_dimensions(striking_files, expected_width, expected_height);
+
+    const fs::path detect_hash_file = detect_dir / ".detect_hash";
+    ASSERT_TRUE(fs::is_regular_file(detect_hash_file));
+    EXPECT_TRUE(is_valid_dir_fingerprint(
+        test_support::read_file_text(detect_hash_file), striking_files.size()));
+    EXPECT_EQ(test_support::list_all_entries(detect_dir).size(), striking_files.size() + 1u);
+
+    const fs::path mosaic_jpg = mosaics_dir / "mosaic.jpg";
+    const fs::path mosaic_hash_file = mosaics_dir / ".mosaic_hash";
+    EXPECT_EQ(test_support::list_all_entries(mosaics_dir).size(), kMosaicDirExpectedEntries);
+    ASSERT_TRUE(fs::is_regular_file(mosaic_hash_file));
+    EXPECT_FALSE(trim_ascii(test_support::read_file_text(mosaic_hash_file)).empty());
+
+    const cv::Mat mosaic = decode_and_verify_jpeg(mosaic_jpg, kMainVideoWidth, kMainVideoHeight);
+    ASSERT_FALSE(mosaic.empty());
+    cv::Scalar mean_val;
+    cv::Scalar stddev_val;
+    cv::meanStdDev(mosaic, mean_val, stddev_val);
+    const double max_channel_stddev = std::max({stddev_val[0], stddev_val[1], stddev_val[2]});
+    EXPECT_GT(max_channel_stddev, kMosaicMinStdDev)
+        << "Mosaic image must contain non-uniform rendered frame content";
+}
+
+void assert_no_temp_dirs_recursive(const fs::path& root) {
+    if (!fs::exists(root)) {
+        return;
+    }
+    for (const auto& entry : fs::recursive_directory_iterator(root)) {
+        if (!entry.is_directory()) {
+            continue;
+        }
+        const std::string name = test_support::path_to_utf8(entry.path().filename());
+        const bool is_forbidden = std::ranges::any_of(
+            kForbiddenTempDirNames,
+            [&name](std::string_view forbidden) noexcept { return name == forbidden; });
+        EXPECT_FALSE(is_forbidden)
+            << "Leftover temporary directory found: " << test_support::path_to_utf8(entry.path());
+    }
+}
+
+[[nodiscard]] av::MediaInfo generate_silent_clip(const fs::path& src, const fs::path& dst) {
+    const av::TranscodeRequest req{
+        .inputs = {src},
+        .output = dst,
+        .filter_description = "[in0v]null[outv]",
+        .video_encoder = "libx264",
+        .video_options = {{"crf", "28"}, {"preset", "ultrafast"}},
+        .audio_copy = false,
+    };
+    NullProgressReporter reporter;
+    const bool ok = av::transcode(req, reporter, 0.0);
+    EXPECT_TRUE(ok) << "Failed to generate silent clip from "
+                    << test_support::path_to_utf8(src) << " to "
+                    << test_support::path_to_utf8(dst);
+
+    test_support::MediaExpectation silent_exp;
+    silent_exp.video_codec = "h264";
+    silent_exp.has_video = true;
+    silent_exp.has_audio = false;
+    const av::MediaInfo info = test_support::probe_valid_media(dst, silent_exp);
+    EXPECT_TRUE(info.audio_codec.empty())
+        << "Expected empty audio_codec for silent clip: " << test_support::path_to_utf8(dst);
+    return info;
 }
 
 [[nodiscard]] std::vector<test_support::FileSnapshot> copy_directory_mp4s(
@@ -227,7 +370,8 @@ void verify_all_jpegs_match_dimensions(
 
 void assert_all_unchanged(std::span<const test_support::FileSnapshot> snaps) {
     for (const auto& snap : snaps) {
-        EXPECT_TRUE(snap.is_unchanged()) << "Input file was unexpectedly modified: " << snap.path();
+        EXPECT_TRUE(snap.is_unchanged())
+            << "Input file was unexpectedly modified: " << test_support::path_to_utf8(snap.path());
     }
 }
 
@@ -272,15 +416,16 @@ TEST_F(SystemTest, PackagedStandaloneExecutablesAndCliContract) {
         SCOPED_TRACE(std::string(contract.name));
 
         const fs::path exe = resolve_tool(contract.id);
+        const std::string exe_display = test_support::path_to_utf8(exe);
         ASSERT_TRUE(fs::is_regular_file(exe))
             << format_missing_tool_diagnostic(contract.name, exe);
-        EXPECT_GT(fs::file_size(exe), 0u) << "Executable is empty: " << exe;
+        EXPECT_GT(fs::file_size(exe), 0u) << "Executable is empty: " << exe_display;
 
         const fs::path bin_dir = exe.parent_path();
         EXPECT_FALSE(fs::exists(bin_dir / "ffmpeg"))
-            << "External ffmpeg binary must not be shipped alongside " << exe;
+            << "External ffmpeg binary must not be shipped alongside " << exe_display;
         EXPECT_FALSE(fs::exists(bin_dir / "ffmpeg.exe"))
-            << "External ffmpeg.exe binary must not be shipped alongside " << exe;
+            << "External ffmpeg.exe binary must not be shipped alongside " << exe_display;
 
         const auto res = run_tool(contract.id, {"--help"}, sandbox.path());
         ASSERT_FALSE(res.timed_out) << format_process_diagnostics(contract.name, res);
@@ -319,7 +464,9 @@ TEST_F(SystemTest, SplitToConcatLosslessRoundTripPipeline) {
 
     const auto split_res = run_tool(
         ToolId::kSplit,
-        {"-i", main_copy.string(), "-o", parts_dir.string(), "-p", "3", "5", "-r"},
+        {"-i", test_support::path_to_utf8(main_copy),
+         "-o", test_support::path_to_utf8(parts_dir),
+         "-p", "3", "5", "-r"},
         sandbox.path());
     ASSERT_FALSE(split_res.timed_out) << format_process_diagnostics("split", split_res);
     ASSERT_EQ(split_res.exit_code, kExpectedSuccessExitCode)
@@ -329,11 +476,11 @@ TEST_F(SystemTest, SplitToConcatLosslessRoundTripPipeline) {
     const auto parts = test_support::list_regular_files(parts_dir, ".mp4");
     ASSERT_EQ(parts.size(), kExpectedSplitPartCount);
 
-    const std::array<double, kExpectedSplitPartCount> expected_part_durations{
+    const std::array<double, kExpectedSplitPartCount> expected_part_durations{{
         kSplitFirstSec,
         kSplitSecondRelSec,
         src_info.duration_sec - kSplitCumulativeSec,
-    };
+    }};
 
     double sum_part_durations = 0.0;
     std::vector<test_support::FileSnapshot> part_snaps;
@@ -341,12 +488,13 @@ TEST_F(SystemTest, SplitToConcatLosslessRoundTripPipeline) {
 
     for (std::size_t idx = 0; idx < parts.size(); ++idx) {
         const auto& part = parts[idx];
-        SCOPED_TRACE(part.string());
+        SCOPED_TRACE(test_support::path_to_utf8(part));
 
-        const std::string expected_prefix =
-            std::format("{}_part{}_", main_copy.stem().string(), idx + 1u);
-        EXPECT_TRUE(part.filename().string().starts_with(expected_prefix))
-            << "Unexpected split part filename: " << part.filename();
+        const std::string expected_prefix = std::format(
+            "{}_part{}_", test_support::path_to_utf8(main_copy.stem()), idx + 1u);
+        const std::string part_filename = test_support::path_to_utf8(part.filename());
+        EXPECT_TRUE(part_filename.starts_with(expected_prefix))
+            << "Unexpected split part filename: " << part_filename;
 
         const av::MediaInfo part_info = test_support::probe_valid_media(
             part,
@@ -364,7 +512,8 @@ TEST_F(SystemTest, SplitToConcatLosslessRoundTripPipeline) {
 
     const auto concat_res = run_tool(
         ToolId::kConcat,
-        {"-i", parts_dir.string(), "-o", joined_dir.string()},
+        {"-i", test_support::path_to_utf8(parts_dir),
+         "-o", test_support::path_to_utf8(joined_dir)},
         sandbox.path());
     ASSERT_FALSE(concat_res.timed_out) << format_process_diagnostics("concat_videos", concat_res);
     ASSERT_EQ(concat_res.exit_code, kExpectedSuccessExitCode)
@@ -419,7 +568,9 @@ TEST_F(SystemTest, CutBlurAndStreamCopyToExtractPipeline) {
     const fs::path cut_output = cut_out_dir / "trimmed.mp4";
     const auto cut_res = run_tool(
         ToolId::kCut,
-        {"-i", main_copy.string(), "-o", cut_output.string(), "-s", "2", "9", "-e", "4", "11"},
+        {"-i", test_support::path_to_utf8(main_copy),
+         "-o", test_support::path_to_utf8(cut_output),
+         "-s", "2", "9", "-e", "4", "11"},
         sandbox.path());
     ASSERT_FALSE(cut_res.timed_out) << format_process_diagnostics("cut", cut_res);
     ASSERT_EQ(cut_res.exit_code, kExpectedSuccessExitCode)
@@ -450,7 +601,8 @@ TEST_F(SystemTest, CutBlurAndStreamCopyToExtractPipeline) {
     const fs::path blur_output = blur_out_dir / "blurred.mp4";
     const auto blur_res = run_tool(
         ToolId::kCut,
-        {"-i", clip_copy.string(), "-o", blur_output.string(),
+        {"-i", test_support::path_to_utf8(clip_copy),
+         "-o", test_support::path_to_utf8(blur_output),
          "-s", "0.5", "-e", "1.5", "--blur", "--sound-off"},
         sandbox.path());
     ASSERT_FALSE(blur_res.timed_out) << format_process_diagnostics("cut --blur", blur_res);
@@ -491,7 +643,8 @@ TEST_F(SystemTest, CutBlurAndStreamCopyToExtractPipeline) {
     const test_support::FileSnapshot cut_snap(cut_output);
     const auto extract_res = run_tool(
         ToolId::kExtract,
-        {"-i", cut_output.string(), "-o", extract_out_dir.string(),
+        {"-i", test_support::path_to_utf8(cut_output),
+         "-o", test_support::path_to_utf8(extract_out_dir),
          "--image", "3", "--image-detect", "--mosaic", "2"},
         sandbox.path());
     ASSERT_FALSE(extract_res.timed_out) << format_process_diagnostics("extract", extract_res);
@@ -500,40 +653,8 @@ TEST_F(SystemTest, CutBlurAndStreamCopyToExtractPipeline) {
     EXPECT_TRUE(cut_snap.is_unchanged());
 
     const fs::path stem_dir = extract_out_dir / cut_output.stem();
-    const fs::path image_dir = stem_dir / "image";
-    const fs::path detect_dir = stem_dir / "detect";
-    const fs::path mosaics_dir = stem_dir / "mosaics";
-
-    EXPECT_EQ(test_support::list_all_entries(image_dir).size(), kExtractImageCount);
-    const auto image_files = test_support::list_regular_files(image_dir, ".jpg", "frame_");
-    ASSERT_EQ(image_files.size(), kExtractImageCount);
-    verify_all_jpegs_match_dimensions(image_files, kMainVideoWidth, kMainVideoHeight);
-
-    const auto striking_files = test_support::list_regular_files(detect_dir, ".jpg", "striking_");
-    ASSERT_GE(striking_files.size(), kExtractMosaicMinStriking);
-    ASSERT_LE(striking_files.size(), kMaxStrikingFrames);
-    verify_all_jpegs_match_dimensions(striking_files, kMainVideoWidth, kMainVideoHeight);
-
-    const fs::path detect_hash_file = detect_dir / ".detect_hash";
-    ASSERT_TRUE(fs::is_regular_file(detect_hash_file));
-    EXPECT_TRUE(
-        is_valid_dir_fingerprint(test_support::read_file_text(detect_hash_file), striking_files.size()));
-    EXPECT_EQ(test_support::list_all_entries(detect_dir).size(), striking_files.size() + 1u);
-
-    const fs::path mosaic_jpg = mosaics_dir / "mosaic.jpg";
-    const fs::path mosaic_hash_file = mosaics_dir / ".mosaic_hash";
-    EXPECT_EQ(test_support::list_all_entries(mosaics_dir).size(), kMosaicDirExpectedEntries);
-    ASSERT_TRUE(fs::is_regular_file(mosaic_hash_file));
-    EXPECT_FALSE(trim_ascii(test_support::read_file_text(mosaic_hash_file)).empty());
-
-    const cv::Mat mosaic = decode_and_verify_jpeg(mosaic_jpg, kMainVideoWidth, kMainVideoHeight);
-    ASSERT_FALSE(mosaic.empty());
-    cv::Scalar mean_val;
-    cv::Scalar stddev_val;
-    cv::meanStdDev(mosaic, mean_val, stddev_val);
-    const double max_channel_stddev = std::max({stddev_val[0], stddev_val[1], stddev_val[2]});
-    EXPECT_GT(max_channel_stddev, kMosaicMinStdDev)
-        << "Mosaic image must contain non-uniform rendered frame content";
+    ASSERT_NO_FATAL_FAILURE(verify_extract_image_detect_mosaic(
+        stem_dir, kMainVideoWidth, kMainVideoHeight, kExtractImageCount));
 }
 
 TEST_F(SystemTest, TranscodeMixedFpsToExtractPipeline) {
@@ -550,7 +671,8 @@ TEST_F(SystemTest, TranscodeMixedFpsToExtractPipeline) {
 
     const auto tx_res = run_tool(
         ToolId::kTranscode,
-        {"-i", mixed_in_dir.string(), "-o", transcode_out_dir.string(),
+        {"-i", test_support::path_to_utf8(mixed_in_dir),
+         "-o", test_support::path_to_utf8(transcode_out_dir),
          "-e", "libx264", "-p", "ultrafast", "-q", "28"},
         sandbox.path());
     ASSERT_FALSE(tx_res.timed_out) << format_process_diagnostics("transcode", tx_res);
@@ -583,7 +705,9 @@ TEST_F(SystemTest, TranscodeMixedFpsToExtractPipeline) {
     const test_support::FileSnapshot tx_snap(transcoded_video);
     const auto extract_res = run_tool(
         ToolId::kExtract,
-        {"-i", transcoded_video.string(), "-o", frames_out_dir.string(), "--image", "4"},
+        {"-i", test_support::path_to_utf8(transcoded_video),
+         "-o", test_support::path_to_utf8(frames_out_dir),
+         "--image", "4"},
         sandbox.path());
     ASSERT_FALSE(extract_res.timed_out) << format_process_diagnostics("extract", extract_res);
     ASSERT_EQ(extract_res.exit_code, kExpectedSuccessExitCode)
@@ -613,7 +737,8 @@ TEST_F(SystemTest, RepeatRunIdempotenceAndFailureHygiene) {
 
     const auto run1 = run_tool(
         ToolId::kExtract,
-        {"-i", video_copy.string(), "-o", idemp_out_dir.string(),
+        {"-i", test_support::path_to_utf8(video_copy),
+         "-o", test_support::path_to_utf8(idemp_out_dir),
          "--image-detect", "--mosaic", "2"},
         sandbox.path());
     ASSERT_FALSE(run1.timed_out) << format_process_diagnostics("extract (run 1)", run1);
@@ -640,7 +765,8 @@ TEST_F(SystemTest, RepeatRunIdempotenceAndFailureHygiene) {
 
     const auto run2 = run_tool(
         ToolId::kExtract,
-        {"-i", video_copy.string(), "-o", idemp_out_dir.string(),
+        {"-i", test_support::path_to_utf8(video_copy),
+         "-o", test_support::path_to_utf8(idemp_out_dir),
          "--image-detect", "--mosaic", "2"},
         sandbox.path());
     ASSERT_FALSE(run2.timed_out) << format_process_diagnostics("extract (run 2)", run2);
@@ -654,7 +780,7 @@ TEST_F(SystemTest, RepeatRunIdempotenceAndFailureHygiene) {
     EXPECT_TRUE(video_snap.is_unchanged());
 
     for (const auto& artifact : pinned) {
-        SCOPED_TRACE(artifact.path.string());
+        SCOPED_TRACE(test_support::path_to_utf8(artifact.path));
         ASSERT_TRUE(fs::is_regular_file(artifact.path));
         EXPECT_EQ(fs::last_write_time(artifact.path), artifact.pinned_mtime)
             << "Cached artifact was rewritten on identical repeat run";
@@ -670,7 +796,8 @@ TEST_F(SystemTest, RepeatRunIdempotenceAndFailureHygiene) {
 
     const auto concat_fail = run_tool(
         ToolId::kConcat,
-        {"-i", single_clip_dir.string(), "-o", concat_fail_out.string()},
+        {"-i", test_support::path_to_utf8(single_clip_dir),
+         "-o", test_support::path_to_utf8(concat_fail_out)},
         sandbox.path());
     ASSERT_FALSE(concat_fail.timed_out) << format_process_diagnostics("concat_videos", concat_fail);
     EXPECT_EQ(concat_fail.exit_code, kExpectedFailureExitCode)
@@ -687,7 +814,9 @@ TEST_F(SystemTest, RepeatRunIdempotenceAndFailureHygiene) {
 
     const auto cut_fail = run_tool(
         ToolId::kCut,
-        {"-i", missing_input.string(), "-o", blocked_output.string(), "-s", "1", "-e", "2"},
+        {"-i", test_support::path_to_utf8(missing_input),
+         "-o", test_support::path_to_utf8(blocked_output),
+         "-s", "1", "-e", "2"},
         sandbox.path());
     ASSERT_FALSE(cut_fail.timed_out) << format_process_diagnostics("cut", cut_fail);
     EXPECT_EQ(cut_fail.exit_code, kExpectedFailureExitCode)
@@ -696,6 +825,348 @@ TEST_F(SystemTest, RepeatRunIdempotenceAndFailureHygiene) {
         << "Failed cut invocation must emit diagnostic output";
     EXPECT_TRUE(test_support::list_all_entries(cut_fail_out).empty())
         << "Failed cut invocation must not create partial outputs";
+}
+
+TEST_F(SystemTest, UnicodeNonAsciiPathsEndToEndPipeline) {
+    const fs::path main_fixture = test_support::require_fixture(test_support::kFixtureMainVideo);
+    const fs::path short_fixture = test_support::require_fixture(test_support::kFixtureUniformClip1);
+    ASSERT_TRUE(fs::is_regular_file(main_fixture));
+    ASSERT_TRUE(fs::is_regular_file(short_fixture));
+
+    const test_support::ScopedTempDir sandbox("st_unicode_e2e");
+    const test_support::ScopedTempDir frame_scratch("st_unicode_frames");
+    const fs::path in_dir = sandbox.create_subdir(u8"in_café_動画");
+    const fs::path parts_dir = sandbox.create_subdir(u8"parts_café_動画");
+    const fs::path joined_dir = sandbox.create_subdir(u8"joined_café_動画");
+    const fs::path cut_dir = sandbox.create_subdir(u8"cut_café_動画");
+    const fs::path tx_dir = sandbox.create_subdir(u8"tx_café_動画");
+    const fs::path ext_dir = sandbox.create_subdir(u8"ext_café_動画");
+
+    const fs::path main_unicode =
+        sandbox.copy_in(main_fixture, u8"in_café_動画/café_動画_2026-01-01 00-00-00.mp4");
+    const fs::path short_unicode =
+        sandbox.copy_in(short_fixture, u8"in_café_動画/café_short_動画.mp4");
+    const std::array<test_support::FileSnapshot, kUnicodeInputCount> input_snaps{{
+        test_support::FileSnapshot(main_unicode),
+        test_support::FileSnapshot(short_unicode),
+    }};
+
+    const av::MediaInfo main_info =
+        test_support::probe_valid_media(main_unicode, make_lossless_main_expectation());
+    ASSERT_TRUE(main_info.ok);
+    ASSERT_GT(main_info.duration_sec, kUnicodeSplitSecondSec + kUnicodeSplitPartTolSec);
+
+    const av::MediaInfo short_info = test_support::probe_valid_media(short_unicode);
+    ASSERT_TRUE(short_info.ok);
+    ASSERT_GT(short_info.width, 0);
+    ASSERT_GT(short_info.height, 0);
+    ASSERT_GT(short_info.duration_sec, 0.0);
+
+    const auto split_res = run_tool(
+        ToolId::kSplit,
+        {"-i", test_support::path_to_utf8(main_unicode),
+         "-o", test_support::path_to_utf8(parts_dir),
+         "-p", "4", "10"},
+        sandbox.path());
+    ASSERT_FALSE(split_res.timed_out) << format_process_diagnostics("split", split_res);
+    ASSERT_EQ(split_res.exit_code, kExpectedSuccessExitCode)
+        << format_process_diagnostics("split", split_res);
+
+    EXPECT_EQ(test_support::list_all_entries(parts_dir).size(), kExpectedSplitPartCount);
+    const auto parts = test_support::list_regular_files(parts_dir, ".mp4");
+    ASSERT_EQ(parts.size(), kExpectedSplitPartCount);
+
+    const std::array<double, kExpectedSplitPartCount> expected_part_durations{{
+        kUnicodeSplitFirstSec,
+        kUnicodeSplitSecondSec - kUnicodeSplitFirstSec,
+        main_info.duration_sec - kUnicodeSplitSecondSec,
+    }};
+
+    double sum_part_durations = 0.0;
+    std::vector<test_support::FileSnapshot> part_snaps;
+    part_snaps.reserve(parts.size());
+
+    for (std::size_t idx = 0; idx < parts.size(); ++idx) {
+        const auto& part = parts[idx];
+        SCOPED_TRACE(test_support::path_to_utf8(part));
+
+        const std::string expected_prefix = std::format(
+            "{}_part{}_", test_support::path_to_utf8(main_unicode.stem()), idx + 1u);
+        const std::string part_filename = test_support::path_to_utf8(part.filename());
+        EXPECT_TRUE(part_filename.starts_with(expected_prefix))
+            << "Unexpected Unicode split part filename: " << part_filename;
+
+        const av::MediaInfo part_info = test_support::probe_valid_media(
+            part,
+            make_lossless_main_expectation(expected_part_durations[idx], kUnicodeSplitPartTolSec));
+        ASSERT_TRUE(part_info.ok);
+
+        sum_part_durations += part_info.duration_sec;
+        part_snaps.emplace_back(part);
+    }
+
+    const auto concat_res = run_tool(
+        ToolId::kConcat,
+        {"-i", test_support::path_to_utf8(parts_dir),
+         "-o", test_support::path_to_utf8(joined_dir)},
+        sandbox.path());
+    ASSERT_FALSE(concat_res.timed_out) << format_process_diagnostics("concat_videos", concat_res);
+    ASSERT_EQ(concat_res.exit_code, kExpectedSuccessExitCode)
+        << format_process_diagnostics("concat_videos", concat_res);
+
+    EXPECT_EQ(test_support::list_all_entries(joined_dir).size(), 1u);
+    const auto joined_files = test_support::list_regular_files(joined_dir, ".mp4", "concatenated_");
+    ASSERT_EQ(joined_files.size(), 1u);
+
+    const fs::path& joined_video = joined_files.front();
+    const av::MediaInfo joined_info = test_support::probe_valid_media(
+        joined_video,
+        make_lossless_main_expectation(main_info.duration_sec, kUnicodeRoundTripTolSec));
+    ASSERT_TRUE(joined_info.ok);
+    EXPECT_NEAR(joined_info.duration_sec, sum_part_durations, kSplitSumMatchTolSec);
+    ASSERT_NO_FATAL_FAILURE(test_support::verify_decodable_frame_at(
+        joined_video, kFrameProbeStartSec, frame_scratch, "unicode_joined.jpg"));
+    assert_all_unchanged(part_snaps);
+
+    const fs::path cut_output = cut_dir / test_support::path_from_u8(u8"結果_café.mp4");
+    const auto cut_res = run_tool(
+        ToolId::kCut,
+        {"-i", test_support::path_to_utf8(main_unicode),
+         "-o", test_support::path_to_utf8(cut_output),
+         "-s", "2", "-e", "5"},
+        sandbox.path());
+    ASSERT_FALSE(cut_res.timed_out) << format_process_diagnostics("cut", cut_res);
+    ASSERT_EQ(cut_res.exit_code, kExpectedSuccessExitCode)
+        << format_process_diagnostics("cut", cut_res);
+
+    EXPECT_EQ(test_support::list_all_entries(cut_dir).size(), 1u);
+    auto cut_expected = make_lossless_main_expectation(
+        main_info.duration_sec - kUnicodeCutRemovedSec, kCutDurationTolSec);
+    cut_expected.expected_fps = std::nullopt;
+    const av::MediaInfo cut_info = test_support::probe_valid_media(cut_output, cut_expected);
+    ASSERT_TRUE(cut_info.ok);
+    EXPECT_LT(cut_info.duration_sec, main_info.duration_sec - kUnicodeCutMinShortenSec);
+    ASSERT_NO_FATAL_FAILURE(test_support::verify_decodable_frame_at(
+        cut_output, kCutProbeStartSec, frame_scratch, "unicode_cut.jpg"));
+
+    const auto tx_res = run_tool(
+        ToolId::kTranscode,
+        {"-i", test_support::path_to_utf8(short_unicode),
+         "-o", test_support::path_to_utf8(tx_dir),
+         "-e", "libx264", "-p", "ultrafast", "-q", "28"},
+        sandbox.path());
+    ASSERT_FALSE(tx_res.timed_out) << format_process_diagnostics("transcode", tx_res);
+    ASSERT_EQ(tx_res.exit_code, kExpectedSuccessExitCode)
+        << format_process_diagnostics("transcode", tx_res);
+
+    EXPECT_EQ(test_support::list_all_entries(tx_dir).size(), 1u);
+    const auto tx_files = test_support::list_regular_files(tx_dir, ".mp4", "transcoded_");
+    ASSERT_EQ(tx_files.size(), 1u);
+
+    test_support::MediaExpectation tx_expected;
+    tx_expected.video_codec = "h264";
+    tx_expected.audio_codec = "aac";
+    tx_expected.width = short_info.width;
+    tx_expected.height = short_info.height;
+    tx_expected.has_video = true;
+    tx_expected.has_audio = true;
+    tx_expected.expected_duration_sec = short_info.duration_sec;
+    tx_expected.duration_tolerance_sec = kTranscodeDurationTolSec;
+    const av::MediaInfo tx_info = test_support::probe_valid_media(tx_files.front(), tx_expected);
+    ASSERT_TRUE(tx_info.ok);
+    ASSERT_NO_FATAL_FAILURE(test_support::verify_decodable_frame_at(
+        tx_files.front(), kFrameProbeStartSec, frame_scratch, "unicode_tx.jpg"));
+
+    const auto ext_res = run_tool(
+        ToolId::kExtract,
+        {"-i", test_support::path_to_utf8(main_unicode),
+         "-o", test_support::path_to_utf8(ext_dir),
+         "--image", "3", "--image-detect", "--mosaic", "2"},
+        sandbox.path());
+    ASSERT_FALSE(ext_res.timed_out) << format_process_diagnostics("extract", ext_res);
+    ASSERT_EQ(ext_res.exit_code, kExpectedSuccessExitCode)
+        << format_process_diagnostics("extract", ext_res);
+
+    const fs::path stem_dir = ext_dir / main_unicode.stem();
+    ASSERT_NO_FATAL_FAILURE(verify_extract_image_detect_mosaic(
+        stem_dir, kMainVideoWidth, kMainVideoHeight, kExtractImageCount));
+    assert_no_temp_dirs_recursive(ext_dir);
+
+    EXPECT_EQ(test_support::list_all_entries(in_dir).size(), input_snaps.size());
+    assert_all_unchanged(input_snaps);
+}
+
+TEST_F(SystemTest, AudioLessTranscodeEndToEndPipeline) {
+    const fs::path mixed_fixture = test_support::require_fixture(test_support::kFixtureMixedFpsDir);
+    ASSERT_TRUE(fs::is_directory(mixed_fixture));
+
+    const auto mixed_sources = test_support::list_regular_files(mixed_fixture, ".mp4");
+    ASSERT_GE(mixed_sources.size(), kTranscodeMinInputClips);
+
+    const test_support::ScopedTempDir sandbox("st_audioless_transcode");
+    const test_support::ScopedTempDir frame_scratch("st_audioless_frames");
+    const fs::path silent_in_dir = sandbox.create_subdir("silent_in");
+    const fs::path single_out_dir = sandbox.create_subdir("single_out");
+    const fs::path multi_out_dir = sandbox.create_subdir("multi_out");
+    const fs::path extract_out_dir = sandbox.create_subdir("extract_out");
+
+    std::vector<fs::path> silent_clips;
+    std::vector<av::MediaInfo> silent_infos;
+    std::vector<test_support::FileSnapshot> silent_snaps;
+    silent_clips.reserve(mixed_sources.size());
+    silent_infos.reserve(mixed_sources.size());
+    silent_snaps.reserve(mixed_sources.size());
+
+    for (const auto& src : mixed_sources) {
+        const fs::path dst = silent_in_dir / src.filename();
+        const av::MediaInfo info = generate_silent_clip(src, dst);
+        ASSERT_TRUE(info.ok);
+        ASSERT_TRUE(info.has_video);
+        ASSERT_FALSE(info.has_audio);
+        ASSERT_TRUE(info.audio_codec.empty());
+        ASSERT_GT(info.width, 0);
+        ASSERT_GT(info.height, 0);
+        silent_clips.push_back(dst);
+        silent_infos.push_back(info);
+        silent_snaps.emplace_back(dst);
+    }
+
+    const fs::path& first_silent = silent_clips.front();
+    const av::MediaInfo& first_silent_info = silent_infos.front();
+
+    const auto single_res = run_tool(
+        ToolId::kTranscode,
+        {"-i", test_support::path_to_utf8(first_silent),
+         "-o", test_support::path_to_utf8(single_out_dir),
+         "-e", "libx264", "-p", "ultrafast", "-q", "28"},
+        sandbox.path());
+    ASSERT_FALSE(single_res.timed_out) << format_process_diagnostics("transcode (single silent)", single_res);
+    ASSERT_EQ(single_res.exit_code, kExpectedSuccessExitCode)
+        << format_process_diagnostics("transcode (single silent)", single_res);
+
+    EXPECT_EQ(test_support::list_all_entries(single_out_dir).size(), 1u);
+    const auto single_files =
+        test_support::list_regular_files(single_out_dir, ".mp4", "transcoded_");
+    ASSERT_EQ(single_files.size(), 1u);
+
+    test_support::MediaExpectation single_expected;
+    single_expected.video_codec = "h264";
+    single_expected.width = first_silent_info.width;
+    single_expected.height = first_silent_info.height;
+    single_expected.has_video = true;
+    single_expected.has_audio = false;
+    single_expected.expected_duration_sec = first_silent_info.duration_sec;
+    single_expected.duration_tolerance_sec = kTranscodeDurationTolSec;
+    const av::MediaInfo single_info =
+        test_support::probe_valid_media(single_files.front(), single_expected);
+    ASSERT_TRUE(single_info.ok);
+    EXPECT_TRUE(single_info.audio_codec.empty());
+    ASSERT_NO_FATAL_FAILURE(test_support::verify_decodable_frame_at(
+        single_files.front(), kFrameProbeStartSec, frame_scratch, "silent_single.jpg"));
+
+    const auto multi_res = run_tool(
+        ToolId::kTranscode,
+        {"-i", test_support::path_to_utf8(silent_in_dir),
+         "-o", test_support::path_to_utf8(multi_out_dir),
+         "-e", "libx264", "-p", "ultrafast", "-q", "28"},
+        sandbox.path());
+    ASSERT_FALSE(multi_res.timed_out) << format_process_diagnostics("transcode (multi silent)", multi_res);
+    ASSERT_EQ(multi_res.exit_code, kExpectedSuccessExitCode)
+        << format_process_diagnostics("transcode (multi silent)", multi_res);
+
+    EXPECT_EQ(test_support::list_all_entries(multi_out_dir).size(), 1u);
+    const auto multi_files =
+        test_support::list_regular_files(multi_out_dir, ".mp4", "transcoded_");
+    ASSERT_EQ(multi_files.size(), 1u);
+
+    const fs::path& silent_multi_video = multi_files.front();
+    test_support::MediaExpectation multi_expected;
+    multi_expected.video_codec = "h264";
+    multi_expected.width = first_silent_info.width;
+    multi_expected.height = first_silent_info.height;
+    multi_expected.has_video = true;
+    multi_expected.has_audio = false;
+    multi_expected.expected_fps = kExpectedFps;
+    multi_expected.fps_tolerance = kFpsTolerance;
+    multi_expected.expected_duration_sec = kTranscodeExpectedDurationSec;
+    multi_expected.duration_tolerance_sec = kTranscodeDurationTolSec;
+    const av::MediaInfo multi_info =
+        test_support::probe_valid_media(silent_multi_video, multi_expected);
+    ASSERT_TRUE(multi_info.ok);
+    EXPECT_TRUE(multi_info.audio_codec.empty());
+
+    const double late_ts =
+        std::max(kFrameProbeStartSec, multi_info.duration_sec - kFrameProbeEndMarginSec);
+    ASSERT_NO_FATAL_FAILURE(test_support::verify_decodable_frame_at(
+        silent_multi_video, kFrameProbeStartSec, frame_scratch, "silent_multi_start.jpg"));
+    ASSERT_NO_FATAL_FAILURE(test_support::verify_decodable_frame_at(
+        silent_multi_video, late_ts, frame_scratch, "silent_multi_end.jpg"));
+
+    const test_support::FileSnapshot multi_snap(silent_multi_video);
+    const auto extract_res = run_tool(
+        ToolId::kExtract,
+        {"-i", test_support::path_to_utf8(silent_multi_video),
+         "-o", test_support::path_to_utf8(extract_out_dir),
+         "--image", "3"},
+        sandbox.path());
+    ASSERT_FALSE(extract_res.timed_out) << format_process_diagnostics("extract (silent)", extract_res);
+    ASSERT_EQ(extract_res.exit_code, kExpectedSuccessExitCode)
+        << format_process_diagnostics("extract (silent)", extract_res);
+    EXPECT_TRUE(multi_snap.is_unchanged());
+
+    const fs::path image_dir = extract_out_dir / silent_multi_video.stem() / "image";
+    EXPECT_EQ(test_support::list_all_entries(image_dir).size(), kSilentExtractImageCount);
+    const auto extracted_frames = test_support::list_regular_files(image_dir, ".jpg", "frame_");
+    ASSERT_EQ(extracted_frames.size(), kSilentExtractImageCount);
+    verify_all_jpegs_match_dimensions(extracted_frames, multi_info.width, multi_info.height);
+
+    EXPECT_EQ(test_support::list_all_entries(silent_in_dir).size(), silent_snaps.size());
+    assert_all_unchanged(silent_snaps);
+}
+
+TEST_F(SystemTest, ConcatMismatchedStreamsFailsCleanlyWithDiagnostic) {
+    const fs::path hevc_fixture = test_support::require_fixture(test_support::kFixtureMainVideo);
+    const fs::path h264_fixture = test_support::require_fixture(test_support::kFixtureUniformClip1);
+    ASSERT_TRUE(fs::is_regular_file(hevc_fixture));
+    ASSERT_TRUE(fs::is_regular_file(h264_fixture));
+
+    const test_support::ScopedTempDir sandbox("st_concat_mismatch");
+    const fs::path in_dir = sandbox.create_subdir("in");
+    const fs::path out_dir = sandbox.create_subdir("out");
+
+    const fs::path first_clip = sandbox.copy_in(hevc_fixture, "in/2026-01-01 00-00-00.mp4");
+    const fs::path second_clip = sandbox.copy_in(h264_fixture, "in/2026-01-02 00-00-00.mp4");
+    const std::array<test_support::FileSnapshot, kMismatchInputCount> input_snaps{{
+        test_support::FileSnapshot(first_clip),
+        test_support::FileSnapshot(second_clip),
+    }};
+
+    const av::MediaInfo first_info = test_support::probe_valid_media(first_clip);
+    const av::MediaInfo second_info = test_support::probe_valid_media(second_clip);
+    ASSERT_TRUE(first_info.ok);
+    ASSERT_TRUE(second_info.ok);
+    ASSERT_NE(first_info.video_codec, second_info.video_codec)
+        << "Precondition failed: mismatch fixtures must carry distinct video codecs";
+
+    const auto res = run_tool(
+        ToolId::kConcat,
+        {"-i", test_support::path_to_utf8(in_dir),
+         "-o", test_support::path_to_utf8(out_dir)},
+        sandbox.path());
+    ASSERT_FALSE(res.timed_out) << format_process_diagnostics("concat_videos", res);
+    EXPECT_EQ(res.exit_code, kExpectedFailureExitCode)
+        << format_process_diagnostics("concat_videos", res);
+    EXPECT_TRUE(!res.stderr_text.empty() || !res.stdout_text.empty())
+        << "Failed concat_videos invocation must emit diagnostic output";
+
+    const std::string combined_output = res.stdout_text + "\n" + res.stderr_text;
+    EXPECT_TRUE(contains_any_case_insensitive(combined_output, kStreamMismatchDiagnosticTerms))
+        << "Expected stream incompatibility diagnostic in concat_videos output:\n"
+        << format_process_diagnostics("concat_videos", res);
+    EXPECT_TRUE(test_support::list_all_entries(out_dir).empty())
+        << "Failed concat_videos invocation must not leave partial output files";
+    EXPECT_EQ(test_support::list_all_entries(in_dir).size(), input_snaps.size());
+    assert_all_unchanged(input_snaps);
 }
 
 }  // namespace

@@ -22,12 +22,14 @@ struct EncodePlan {
     std::string preset;             // "" -> EncoderProfile default
     bool hwaccel_cuda = false;      // decode on GPU where supported
     av::FrameRate target_fps;       // known() -> fps=N/D before concat
+    bool has_audio = true;          // false -> video-only filter graph (no "inNa"/"outa" pads)
 
     [[nodiscard]] bool operator==(const EncodePlan&) const = default;
 };
 
-// Assemble the ffmpeg filter graph for `plan` with input pads "inNv"/"inNa"
-// and outputs "outv"/"outa". Returns empty string when plan.inputs is empty.
+// Assemble the ffmpeg filter graph for `plan` with input pads "inNv" (and
+// "inNa" when plan.has_audio is true) and outputs "outv" (and "outa" when
+// plan.has_audio is true). Returns empty string when plan.inputs is empty.
 [[nodiscard]] std::string build_filter_description(const EncodePlan& plan);
 
 // Assemble the complete av::TranscodeRequest for `plan`.

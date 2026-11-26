@@ -1,16 +1,16 @@
 #include "extract/frame_scorer.h"
 
-#include <array>
-#include <cstddef>
+#include "extract/image_io.h"
 
 #include <opencv2/core.hpp>
-#include <opencv2/imgcodecs.hpp>
 #include <opencv2/imgproc.hpp>
 
 namespace {
 
-constexpr std::size_t kHsvChannelCount = 3;
-constexpr std::size_t kSaturationChannel = 1;
+constexpr int kChannelsGray = 1;
+constexpr int kChannelsBgr = 3;
+constexpr int kChannelsBgra = 4;
+constexpr int kSaturationChannel = 1;
 constexpr double kCannyLowThreshold = 100.0;
 constexpr double kCannyHighThreshold = 200.0;
 constexpr double kSharpnessDivisor = 50.0;
@@ -21,26 +21,44 @@ constexpr double kEdgeDensityWeight = 200.0;
 }  // namespace
 
 double FrameScorer::score(const fs::path& image_path) const {
-    const cv::Mat frame = cv::imread(image_path.string());
-    if (frame.empty() || frame.cols <= 0 || frame.rows <= 0) {
+    const cv::Mat frame = extract_io::read_image(image_path);
+    return score(frame);
+}
+
+double FrameScorer::score(const cv::Mat& frame) const {
+    if (frame.empty() || frame.cols <= 0 || frame.rows <= 0 || frame.depth() != CV_8U) {
         return 0.0;
     }
 
     cv::Mat gray;
-    cv::cvtColor(frame, gray, cv::COLOR_BGR2GRAY);
+    double saturation = 0.0;
+    const int channels = frame.channels();
 
+    if (channels == kChannelsBgr) {
+        cv::cvtColor(frame, gray, cv::COLOR_BGR2GRAY);
+        cv::Mat hsv;
+        cv::cvtColor(frame, hsv, cv::COLOR_BGR2HSV);
+        saturation = cv::mean(hsv).val[kSaturationChannel];
+    } else if (channels == kChannelsGray) {
+        gray = frame;
+    } else if (channels == kChannelsBgra) {
+        cv::Mat bgr;
+        cv::cvtColor(frame, bgr, cv::COLOR_BGRA2BGR);
+        cv::cvtColor(bgr, gray, cv::COLOR_BGR2GRAY);
+        cv::Mat hsv;
+        cv::cvtColor(bgr, hsv, cv::COLOR_BGR2HSV);
+        saturation = cv::mean(hsv).val[kSaturationChannel];
+    } else {
+        return 0.0;
+    }
+
+    // 3x3 Laplacian on CV_8U stays within [-1020, 1020], lossless in CV_16S.
     cv::Mat laplacian;
-    cv::Laplacian(gray, laplacian, CV_64F);
+    cv::Laplacian(gray, laplacian, CV_16S);
     cv::Scalar lap_mean;
     cv::Scalar lap_stddev;
     cv::meanStdDev(laplacian, lap_mean, lap_stddev);
     const double sharpness = lap_stddev.val[0] * lap_stddev.val[0];
-
-    cv::Mat hsv;
-    cv::cvtColor(frame, hsv, cv::COLOR_BGR2HSV);
-    std::array<cv::Mat, kHsvChannelCount> hsv_channels;
-    cv::split(hsv, hsv_channels.data());
-    const double saturation = cv::mean(hsv_channels[kSaturationChannel]).val[0];
 
     cv::Scalar gray_mean;
     cv::Scalar gray_stddev;

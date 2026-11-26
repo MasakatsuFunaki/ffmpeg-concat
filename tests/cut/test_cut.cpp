@@ -12,6 +12,7 @@
 
 #include <array>
 #include <cstddef>
+#include <cstdint>
 #include <filesystem>
 #include <span>
 #include <string>
@@ -30,9 +31,12 @@ using test_support::kFixtureMainVideo;
 using test_support::kFixtureUniformClip1;
 using test_support::list_all_entries;
 using test_support::list_regular_files;
+using test_support::path_to_utf8;
 using test_support::probe_valid_media;
+using test_support::read_file_bytes;
 using test_support::require_fixture;
 using test_support::run_tool_app;
+using test_support::u8_to_utf8;
 using test_support::verify_decodable_frame_at;
 
 constexpr double kFpsTolerance = 1.0;
@@ -50,6 +54,12 @@ constexpr double kMinBlurPixelDiff = 2.0;
 constexpr double kStartProbeSec = 0.5;
 constexpr double kEndMarginSec = 0.5;
 constexpr std::size_t kMaxFaultArgs = 8;
+constexpr std::size_t kExpectedSingleEntry = 1;
+constexpr std::u8string_view kUnicodeInDir = u8"in_café_動画";
+constexpr std::u8string_view kUnicodeOutDir = u8"out_café_動画";
+constexpr std::u8string_view kUnicodeSourceRel = u8"in_café_動画/café_動画_source.mp4";
+constexpr std::u8string_view kUnicodeOutputRel = u8"out_café_動画/結果_café.mp4";
+constexpr std::u8string_view kUnicodeDecodedFrameName = u8"café_動画_frame.jpg";
 
 struct CutFaultCase {
     std::string_view label;
@@ -72,11 +82,21 @@ constexpr std::array<CutFaultCase, 6> kCutFaultCases{{
     std::string_view filename) {
     const fs::path frame_path = scratch.child(filename);
     EXPECT_TRUE(av::grab_frame(video_file, frame_path, timestamp_sec))
-        << "Failed to grab frame at t=" << timestamp_sec << "s from " << video_file;
+        << "Failed to grab frame at t=" << timestamp_sec << "s from "
+        << path_to_utf8(video_file);
     if (!fs::is_regular_file(frame_path)) {
         return {};
     }
-    return cv::imread(frame_path.string(), cv::IMREAD_COLOR);
+    const auto bytes = read_file_bytes(frame_path);
+    if (bytes.empty()) {
+        return {};
+    }
+    std::vector<std::uint8_t> encoded;
+    encoded.reserve(bytes.size());
+    for (const std::byte b : bytes) {
+        encoded.push_back(std::to_integer<std::uint8_t>(b));
+    }
+    return cv::imdecode(encoded, cv::IMREAD_COLOR);
 }
 
 [[nodiscard]] double mean_abs_pixel_diff(const cv::Mat& a, const cv::Mat& b) {
@@ -360,11 +380,70 @@ TEST(CutComponentTest, InvalidInputsAndIntervalsFailWithoutPartialOutputs) {
         const int rc = run_tool_app<CutApp>(std::span<const std::string>{args});
         EXPECT_EQ(1, rc);
         EXPECT_TRUE(list_all_entries(out_dir).empty())
-            << "Failed cut invocation left partial/stray files in " << out_dir;
+            << "Failed cut invocation left partial/stray files in " << path_to_utf8(out_dir);
     }
 
     EXPECT_TRUE(input_snap.is_unchanged());
     EXPECT_EQ(1u, list_all_entries(in_dir).size());
+}
+
+TEST(CutComponentTest, UnicodeNonAsciiPathsCutLosslesslyAndPreserveInput) {
+    const fs::path fixture = require_fixture(kFixtureMainVideo);
+    ASSERT_TRUE(fs::is_regular_file(fixture));
+
+    ScopedTempDir sandbox("cut_unicode");
+    const fs::path in_dir = sandbox.create_subdir(kUnicodeInDir);
+    const fs::path out_dir = sandbox.create_subdir(kUnicodeOutDir);
+    ScopedTempDir scratch("cut_unicode_frames");
+
+    const fs::path input_copy = sandbox.copy_in(fixture, kUnicodeSourceRel);
+    const FileSnapshot input_snap(input_copy);
+    const av::MediaInfo src_info = probe_valid_media(input_copy);
+    ASSERT_TRUE(src_info.ok);
+
+    const fs::path out_file = sandbox.child(kUnicodeOutputRel);
+    const std::string in_arg = path_to_utf8(input_copy);
+    const std::string out_arg = path_to_utf8(out_file);
+    const int rc = run_tool_app<CutApp>({
+        "cut",
+        "-i", in_arg,
+        "-o", out_arg,
+        "-s", "2",
+        "-e", "5",
+    });
+    ASSERT_EQ(0, rc);
+
+    const auto out_entries = list_all_entries(out_dir);
+    ASSERT_EQ(kExpectedSingleEntry, out_entries.size())
+        << "Expected exact single output with zero stray temp files";
+    EXPECT_EQ(out_file, out_entries.front());
+    EXPECT_EQ(kExpectedSingleEntry, list_all_entries(in_dir).size())
+        << "Input directory must remain free of temp files";
+    EXPECT_TRUE(input_snap.is_unchanged()) << "Input media was modified in place";
+
+    const av::MediaInfo out_info = probe_valid_media(
+        out_file,
+        MediaExpectation{
+            .video_codec = "hevc",
+            .audio_codec = "aac",
+            .width = src_info.width,
+            .height = src_info.height,
+            .has_video = true,
+            .has_audio = true,
+            .expected_fps = src_info.frame_rate.value(),
+            .fps_tolerance = kFpsTolerance,
+        });
+    ASSERT_TRUE(out_info.ok);
+    EXPECT_GT(out_info.duration_sec, kSingleCutMinDurationSec);
+    EXPECT_LT(out_info.duration_sec, src_info.duration_sec - kSingleCutMinReductionSec);
+
+    verify_decodable_frame_at(out_file, kStartProbeSec, scratch, "unicode_start.jpg");
+    const cv::Mat end_frame = decode_frame_bgr(
+        out_file, out_info.duration_sec - kEndMarginSec, scratch,
+        u8_to_utf8(kUnicodeDecodedFrameName));
+    ASSERT_FALSE(end_frame.empty());
+    EXPECT_EQ(src_info.width, end_frame.cols);
+    EXPECT_EQ(src_info.height, end_frame.rows);
 }
 
 }  // namespace

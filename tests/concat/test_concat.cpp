@@ -1,6 +1,8 @@
 #include "concat/concat.h"
 
 #include "av/media_probe.h"
+#include "av/transcoder.h"
+#include "ffmpeg/progress_reporter.h"
 #include "support/cli_runner.hpp"
 #include "support/media_assertions.hpp"
 #include "support/test_sandbox.hpp"
@@ -8,8 +10,10 @@
 #include <gtest/gtest.h>
 
 #include <algorithm>
+#include <cstddef>
 #include <filesystem>
 #include <string>
+#include <string_view>
 #include <vector>
 
 namespace {
@@ -19,10 +23,12 @@ namespace fs = std::filesystem;
 using test_support::FileSnapshot;
 using test_support::MediaExpectation;
 using test_support::ScopedTempDir;
+using test_support::kFixtureMainVideo;
 using test_support::kFixtureUniformClip1;
 using test_support::kFixtureUniformClip2;
 using test_support::list_all_entries;
 using test_support::list_regular_files;
+using test_support::path_to_utf8;
 using test_support::probe_valid_media;
 using test_support::require_fixture;
 using test_support::run_tool_app;
@@ -34,6 +40,25 @@ constexpr double kDurationToleranceSec = 0.6;
 constexpr double kRepeatDurationToleranceSec = 1.0;
 constexpr double kStartProbeSec = 0.2;
 constexpr double kEndMarginSec = 0.5;
+constexpr std::size_t kExpectedSingleOutput = 1;
+constexpr std::size_t kExpectedTwoInputs = 2;
+constexpr std::u8string_view kUnicodeInDir = u8"in_café_動画";
+constexpr std::u8string_view kUnicodeOutDir = u8"out_café_動画";
+constexpr std::u8string_view kUnicodeClip1Rel = u8"in_café_動画/café_動画_2026-01-01 00-00-00.mp4";
+constexpr std::u8string_view kUnicodeClip2Rel = u8"in_café_動画/café_動画_2026-01-02 00-00-00.mp4";
+
+[[nodiscard]] bool create_silent_h264_clip(
+    const fs::path& src, const fs::path& dst, double src_duration_sec) {
+    av::TranscodeRequest req;
+    req.inputs = {src};
+    req.output = dst;
+    req.filter_description = "[in0v]null[outv]";
+    req.video_encoder = "libx264";
+    req.video_options = {{"crf", "28"}, {"preset", "ultrafast"}};
+    req.audio_copy = false;
+    NullProgressReporter reporter;
+    return av::transcode(req, reporter, src_duration_sec);
+}
 
 TEST(ConcatComponentTest, MultiClipLosslessConcatIgnoresNonMp4Siblings) {
     const fs::path clip1 = require_fixture(kFixtureUniformClip1);
@@ -263,6 +288,148 @@ TEST(ConcatComponentTest, FaultCasesAndMidBatchCorruptInputLeaveZeroPartialOutpu
             << "Mid-batch corrupt input leaked a partial output or temp file";
         EXPECT_TRUE(valid_clip.is_unchanged());
     }
+}
+
+TEST(ConcatComponentTest, RejectsMismatchedCodecsAndAudioPresenceWithoutPartialOutputs) {
+    const fs::path main_video = require_fixture(kFixtureMainVideo);
+    const fs::path uniform_clip = require_fixture(kFixtureUniformClip1);
+    ASSERT_TRUE(fs::is_regular_file(main_video));
+    ASSERT_TRUE(fs::is_regular_file(uniform_clip));
+
+    const av::MediaInfo main_info = probe_valid_media(main_video);
+    const av::MediaInfo clip_info = probe_valid_media(uniform_clip);
+    ASSERT_TRUE(main_info.ok);
+    ASSERT_TRUE(clip_info.ok);
+    ASSERT_NE(main_info.video_codec, clip_info.video_codec);
+
+    ScopedTempDir sandbox("concat_mismatch");
+
+    {
+        SCOPED_TRACE("MismatchedCodecsAndResolution");
+        const fs::path in_dir = sandbox.create_subdir("in_codec");
+        const fs::path out_dir = sandbox.create_subdir("out_codec");
+        const FileSnapshot snap_main(
+            sandbox.copy_in(main_video, "in_codec/2026-01-01 00-00-00.mp4"));
+        const FileSnapshot snap_clip(
+            sandbox.copy_in(uniform_clip, "in_codec/2026-01-02 00-00-00.mp4"));
+
+        const std::string in_arg = path_to_utf8(in_dir);
+        const std::string out_arg = path_to_utf8(out_dir);
+        const int rc = run_tool_app<ConcatApp>({
+            "concat_videos",
+            "-i", in_arg,
+            "-o", out_arg,
+        });
+        EXPECT_EQ(1, rc);
+        EXPECT_TRUE(list_all_entries(out_dir).empty())
+            << "Mismatched codec concat leaked a partial output or temp file";
+        EXPECT_TRUE(snap_main.is_unchanged());
+        EXPECT_TRUE(snap_clip.is_unchanged());
+        EXPECT_EQ(kExpectedTwoInputs, list_all_entries(in_dir).size());
+    }
+
+    {
+        SCOPED_TRACE("MismatchedAudioPresenceSameCodecAndResolution");
+        const fs::path in_dir = sandbox.create_subdir("in_audio");
+        const fs::path out_dir = sandbox.create_subdir("out_audio");
+        const fs::path av_clip = sandbox.copy_in(uniform_clip, "in_audio/2026-01-01 00-00-00.mp4");
+        const fs::path silent_clip = in_dir / "2026-01-02 00-00-00.mp4";
+        ASSERT_TRUE(create_silent_h264_clip(uniform_clip, silent_clip, clip_info.duration_sec));
+
+        const av::MediaInfo silent_info = probe_valid_media(
+            silent_clip,
+            MediaExpectation{
+                .video_codec = clip_info.video_codec,
+                .audio_codec = "",
+                .width = clip_info.width,
+                .height = clip_info.height,
+                .has_video = true,
+                .has_audio = false,
+            });
+        ASSERT_TRUE(silent_info.ok);
+        ASSERT_FALSE(silent_info.has_audio);
+        ASSERT_TRUE(silent_info.audio_codec.empty());
+
+        const FileSnapshot snap_av(av_clip);
+        const FileSnapshot snap_silent(silent_clip);
+
+        const std::string in_arg = path_to_utf8(in_dir);
+        const std::string out_arg = path_to_utf8(out_dir);
+        const int rc = run_tool_app<ConcatApp>({
+            "concat_videos",
+            "-i", in_arg,
+            "-o", out_arg,
+        });
+        EXPECT_EQ(1, rc);
+        EXPECT_TRUE(list_all_entries(out_dir).empty())
+            << "Audio/video + silent concat leaked a partial output or temp file";
+        EXPECT_TRUE(snap_av.is_unchanged());
+        EXPECT_TRUE(snap_silent.is_unchanged());
+        EXPECT_EQ(kExpectedTwoInputs, list_all_entries(in_dir).size());
+    }
+}
+
+TEST(ConcatComponentTest, UnicodeNonAsciiPathsConcatenateLosslessly) {
+    const fs::path clip1 = require_fixture(kFixtureUniformClip1);
+    const fs::path clip2 = require_fixture(kFixtureUniformClip2);
+    ASSERT_TRUE(fs::is_regular_file(clip1));
+    ASSERT_TRUE(fs::is_regular_file(clip2));
+
+    ScopedTempDir sandbox("concat_unicode");
+    const fs::path in_dir = sandbox.create_subdir(kUnicodeInDir);
+    const fs::path out_dir = sandbox.create_subdir(kUnicodeOutDir);
+    ScopedTempDir scratch("concat_unicode_frames");
+
+    const fs::path u_clip1 = sandbox.copy_in(clip1, kUnicodeClip1Rel);
+    const fs::path u_clip2 = sandbox.copy_in(clip2, kUnicodeClip2Rel);
+    const FileSnapshot snap1(u_clip1);
+    const FileSnapshot snap2(u_clip2);
+
+    const av::MediaInfo info1 = probe_valid_media(u_clip1);
+    const av::MediaInfo info2 = probe_valid_media(u_clip2);
+    ASSERT_TRUE(info1.ok);
+    ASSERT_TRUE(info2.ok);
+    ASSERT_TRUE(info1.has_video && info1.has_audio);
+    ASSERT_TRUE(info2.has_video && info2.has_audio);
+
+    const std::string in_arg = path_to_utf8(in_dir);
+    const std::string out_arg = path_to_utf8(out_dir);
+    const int rc = run_tool_app<ConcatApp>({
+        "concat_videos",
+        "-i", in_arg,
+        "-o", out_arg,
+    });
+    ASSERT_EQ(0, rc);
+
+    const auto out_entries = list_all_entries(out_dir);
+    ASSERT_EQ(kExpectedSingleOutput, out_entries.size())
+        << "Expected exact single output with zero stray temp files";
+    const auto outputs = list_regular_files(out_dir, ".mp4", "concatenated_");
+    ASSERT_EQ(kExpectedSingleOutput, outputs.size());
+
+    const av::MediaInfo out_info = probe_valid_media(
+        outputs.front(),
+        MediaExpectation{
+            .video_codec = info1.video_codec,
+            .audio_codec = info1.audio_codec,
+            .width = info1.width,
+            .height = info1.height,
+            .has_video = true,
+            .has_audio = true,
+            .expected_fps = info1.frame_rate.value(),
+            .fps_tolerance = kFpsTolerance,
+            .expected_duration_sec = info1.duration_sec + info2.duration_sec,
+            .duration_tolerance_sec = kDurationToleranceSec,
+        });
+    ASSERT_TRUE(out_info.ok);
+
+    verify_decodable_frame_at(outputs.front(), kStartProbeSec, scratch, "unicode_start.jpg");
+    verify_decodable_frame_at(
+        outputs.front(), out_info.duration_sec - kEndMarginSec, scratch, "unicode_end.jpg");
+
+    EXPECT_TRUE(snap1.is_unchanged());
+    EXPECT_TRUE(snap2.is_unchanged());
+    EXPECT_EQ(kExpectedTwoInputs, list_all_entries(in_dir).size());
 }
 
 }  // namespace

@@ -9,6 +9,7 @@ class FFmpegToolsConan(ConanFile):
     def requirements(self):
         self.requires("boost/1.84.0")
         self.requires("gtest/1.14.0")
+        self.requires("benchmark/1.8.5")
         self.requires("opencv/4.9.0")
         self.requires("openssl/3.2.1")
         self.requires("indicators/2.3")

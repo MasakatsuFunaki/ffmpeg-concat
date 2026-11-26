@@ -46,10 +46,13 @@ std::string build_filter_description(const EncodePlan& plan) {
         : std::string{};
 
     if (plan.inputs.size() == 1) {
-        if (normalize) {
-            return std::format("[in0v]fps={}[outv];[in0a]anull[outa]", rate);
+        const std::string video = normalize
+            ? std::format("[in0v]fps={}[outv]", rate)
+            : std::string{"[in0v]null[outv]"};
+        if (!plan.has_audio) {
+            return video;
         }
-        return "[in0v]null[outv];[in0a]anull[outa]";
+        return video + ";[in0a]anull[outa]";
     }
 
     const auto indices = std::views::iota(std::size_t{0}, plan.inputs.size());
@@ -64,14 +67,23 @@ std::string build_filter_description(const EncodePlan& plan) {
         filter.push_back(';');
     }
 
+    const bool has_audio = plan.has_audio;
     filter += core::join(
-        indices | std::views::transform([normalize](std::size_t i) {
-            return normalize ? std::format("[v{}][in{}a]", i, i)
-                             : std::format("[in{}v][in{}a]", i, i);
+        indices | std::views::transform([normalize, has_audio](std::size_t i) {
+            if (has_audio) {
+                return normalize ? std::format("[v{}][in{}a]", i, i)
+                                 : std::format("[in{}v][in{}a]", i, i);
+            }
+            return normalize ? std::format("[v{}]", i)
+                             : std::format("[in{}v]", i);
         }),
         "");
 
-    filter += std::format("concat=n={}:v=1:a=1[outv][outa]", plan.inputs.size());
+    if (has_audio) {
+        filter += std::format("concat=n={}:v=1:a=1[outv][outa]", plan.inputs.size());
+    } else {
+        filter += std::format("concat=n={}:v=1:a=0[outv]", plan.inputs.size());
+    }
     return filter;
 }
 

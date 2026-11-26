@@ -14,8 +14,8 @@ Full NLE suites re-encode everything on export even for a simple trim or join, w
 
 Download the latest standalone archive for your platform from [**GitHub Releases**](https://github.com/MasakatsuFunaki/ffmpeg-concat/releases):
 
-* **Windows (x64):** `ffmpeg-tools-v2.1.0-windows-x64.zip`
-* **Linux (x64):** `ffmpeg-tools-v2.1.0-linux-x64.tar.gz`
+* **Windows (x64):** `ffmpeg-tools-v2.2.0-windows-x64.zip`
+* **Linux (x64):** `ffmpeg-tools-v2.2.0-linux-x64.tar.gz`
 
 Extract the archive anywhere (optionally add the folder to your `PATH`) and run the executables directly — nothing else needs to be installed. Running any tool with **no arguments** or with `--help` / `-h` displays its full CLI usage.
 
@@ -58,8 +58,8 @@ concat_videos.exe --input "recordings\session1" --output "recordings\joined"
 Re-encodes a single `.mp4` file or an entire directory of `.mp4` files into **AV1** or **H.264** (`transcoded_<YYYY-MM-DD_HH-MM-SS>.mp4`).
 
 * **Single-pass multi-file join:** When given a directory with multiple `.mp4` files (sorted by filename date or modification time), joins all segments in a single pass via `libavfilter` `concat`, automatically normalizing mixed frame rates to the lowest segment's FPS.
-* **GPU decode & encode:** Automatically uses `CUDA`/`NVDEC` hardware decoding when available on the host (with transparent software fallback). When `--encoder` is omitted, probes compiled AV1 encoders at runtime and selects the fastest usable one on the machine (`av1_nvenc` → `libsvtav1` → `libaom-av1`).
-* **Audio:** Re-encodes audio to **AAC 192 kbps** (input `.mp4` files must include an audio stream).
+* **GPU decode & encode:** Automatically uses `CUDA`/`NVDEC` hardware decoding when available on the host (with zero-copy `NVDEC → NVENC` CUDA passthrough for single-file transcodes and transparent software fallback). When `--encoder` is omitted, probes compiled AV1 encoders at runtime and selects the fastest usable one on the machine (`av1_nvenc` → `libsvtav1` → `libaom-av1`).
+* **Audio:** Re-encodes audio to **AAC 192 kbps** when present, and supports silent (video-only) `.mp4` files automatically.
 
 **Options:**
 
@@ -192,6 +192,7 @@ Extracts JPEG frames, 1920×1080 summary mosaics, and deduplicated text crops fr
 | `--image-detect` | Auto-detect up to 100 visually striking frames per video (cached via SHA-256 `.detect_hash`) | off |
 | `--mosaic <N> [P]` | Build a 1920×1080 grid mosaic of `N` time-distributed striking frames starting from 1-indexed position `P` (default `1`; requires `--image-detect`; cached via `.mosaic_hash`) | — |
 | `--extract-text` | Detect and crop unique Latin/Western text regions via OpenCV MSER + perceptual deduplication | off |
+| `--profile` | Print per-stage profiling summary after extraction | off |
 | `--help, -h` | Show help message | — |
 
 **Modes (at least one of `--image`, `--image-detect`, or `--extract-text` is required; all modes can run together):**
@@ -240,8 +241,9 @@ extract.exe -i my_videos -o frames --image 5 --image-detect --mosaic 4 --extract
 ├── cmake/             # CMake helper modules & build configuration
 ├── src/
 │   ├── common.h/.cpp  # ToolApp base class (Template Method) & FFmpegUtils facade
-│   ├── core/          # C++20 concepts, zero-overhead RAII UniqueHandle/ScopeGuard & std::format utils
-│   ├── av/            # In-process libavformat/libavcodec/libavfilter/libswscale wrappers
+│   ├── core/          # C++20 concepts, RAII handles, UTF-8 path utils, profiler & jthread pool
+│   ├── platform/      # CMake-selected OS abstraction layer (cli_args, locale_guard, time_util)
+│   ├── av/            # In-process libavformat/libavcodec/libavfilter/libswscale wrappers & FrameSampler
 │   ├── ffmpeg/        # Domain Ffmpeg facade & ProgressReporter (PIMPL indicators progress bars)
 │   ├── media/         # Filename date parsing ("YYYY-MM-DD HH-MM-SS"), sorting & timestamp helpers
 │   ├── encode/        # EncoderCatalog runtime probe, EncoderProfile strategies & EncodePlan filter builder
@@ -251,8 +253,9 @@ extract.exe -i my_videos -o frames --image 5 --image-detect --mosaic 4 --extract
 │   ├── cut/           # cut CLI
 │   ├── split/         # split CLI
 │   └── extract/       # extract CLI (main entrypoint)
+├── benchmark/         # Google Benchmark performance suite + GoogleTest profiler unit tests
 ├── tests/             # GoogleTest suites labeled by tier: UT (Unit), CT (Component) & ST (System E2E)
-├── build.py           # Cross-platform Conan 2 + CMake build, test & install driver
+├── build.py           # Cross-platform Conan 2 + CMake build, test, benchmark & install driver
 └── release.py         # Single-branch main release tagger & local packager
 ```
 
@@ -282,6 +285,10 @@ python build.py --test
 python build.py --tier UT
 python build.py --tier CT
 python build.py --tier ST
+
+# Build and run the Google Benchmark performance suite (+ per-stage profiler summary)
+python build.py --benchmark
+python build.py --benchmark -- --profile-summary
 
 # Stage standalone deliverables into install/win/ (Windows) or install/linux/ (Linux)
 python build.py --install
@@ -319,7 +326,7 @@ Releases follow a single-branch workflow on `main`:
 
 ```bash
 # Tag an explicit version on main and push main + the annotated tag to GitHub
-python release.py --tag v2.1.0
+python release.py --tag v2.2.0
 
 # Or automatically bump the latest semver tag (patch | minor | major)
 python release.py --bump minor

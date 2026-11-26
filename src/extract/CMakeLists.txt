@@ -9,6 +9,7 @@ else()
 endif()
 
 add_library(extractcore STATIC
+    image_io.h
     frame_extractor.cpp frame_extractor.h
     equally_spaced_extractor.cpp equally_spaced_extractor.h
     striking_frame_extractor.cpp striking_frame_extractor.h
@@ -20,11 +21,11 @@ add_library(extractcore STATIC
     mosaic_builder.cpp mosaic_builder.h
     fingerprint_cache.cpp fingerprint_cache.h)
 add_library(ffmpeg_tools::extractcore ALIAS extractcore)
-target_link_libraries(extractcore PUBLIC common ${EXTRACT_OPENCV_LIBS} OpenSSL::Crypto)
+target_link_libraries(extractcore PUBLIC av_frame ${EXTRACT_OPENCV_LIBS} OpenSSL::Crypto)
 target_compile_definitions(extractcore PRIVATE ${PLATFORM_DEFS})
 ffmpeg_tools_set_warnings(extractcore)
 
 add_executable(extract extract.cpp)
-target_link_libraries(extract PRIVATE extractcore common Boost::program_options Boost::filesystem Boost::log ${EXTRACT_OPENCV_LIBS} OpenSSL::Crypto ${PLATFORM_LIBS})
+target_link_libraries(extract PRIVATE extractcore av_frame Boost::program_options Boost::log ${EXTRACT_OPENCV_LIBS} OpenSSL::Crypto ${PLATFORM_LIBS})
 target_compile_definitions(extract PRIVATE ${PLATFORM_DEFS})
 ffmpeg_tools_set_warnings(extract)

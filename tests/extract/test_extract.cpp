@@ -13,6 +13,7 @@
 #include <array>
 #include <chrono>
 #include <cstddef>
+#include <cstdint>
 #include <filesystem>
 #include <format>
 #include <optional>
@@ -49,6 +50,12 @@ constexpr std::size_t kExpectedSingleSubdir = 1;
 constexpr std::size_t kExpectedMosaicEntries = 2;
 constexpr std::size_t kExpectedCombinedSubdirs = 3;
 constexpr std::size_t kMaxInvalidCliExtraArgs = 4;
+constexpr std::string_view kTempCandidatesDirName = "_temp_candidates";
+constexpr std::string_view kTempTextDirName = "_temp_text";
+constexpr std::u8string_view kUnicodeVideoRel =
+    u8"in_café_動画/café_動画_2026-01-01 00-00-00.mp4";
+constexpr std::u8string_view kUnicodeVideoStem = u8"café_動画_2026-01-01 00-00-00";
+constexpr std::u8string_view kUnicodeOutDir = u8"out_café_動画";
 
 struct PinnedFile {
     fs::path path;
@@ -83,17 +90,19 @@ struct InvalidCliCase {
 }
 
 [[nodiscard]] std::string read_non_empty_cache_file(const fs::path& hash_file) {
-    EXPECT_TRUE(fs::is_regular_file(hash_file)) << "Missing cache file: " << hash_file;
+    const std::string display = test_support::path_to_utf8(hash_file);
+    EXPECT_TRUE(fs::is_regular_file(hash_file)) << "Missing cache file: " << display;
     if (!fs::is_regular_file(hash_file)) {
         return {};
     }
     const std::string text = read_trimmed_text(hash_file);
-    EXPECT_FALSE(text.empty()) << "Empty cache file: " << hash_file;
+    EXPECT_FALSE(text.empty()) << "Empty cache file: " << display;
     return text;
 }
 
 [[nodiscard]] std::string read_verified_dir_fingerprint_file(
     const fs::path& hash_file, std::size_t expected_entry_count) {
+    const std::string display = test_support::path_to_utf8(hash_file);
     const std::string text = read_non_empty_cache_file(hash_file);
     if (text.empty()) {
         return {};
@@ -111,15 +120,15 @@ struct InvalidCliCase {
         if (!line.empty()) {
             const auto colon = line.rfind(':');
             EXPECT_NE(colon, std::string_view::npos)
-                << "Expected name:sha256 entry in " << hash_file << ": " << line;
+                << "Expected name:sha256 entry in " << display << ": " << line;
             if (colon != std::string_view::npos) {
                 const auto name = line.substr(0, colon);
                 const auto hex = line.substr(colon + 1);
                 EXPECT_FALSE(name.empty()) << "Empty filename in fingerprint line: " << line;
                 EXPECT_EQ(hex.size(), kSha256HexLength)
-                    << "Unexpected SHA-256 hex length in " << hash_file << ": " << line;
+                    << "Unexpected SHA-256 hex length in " << display << ": " << line;
                 EXPECT_TRUE(std::ranges::all_of(hex, is_hex_char))
-                    << "Non-hex characters in " << hash_file << ": " << line;
+                    << "Non-hex characters in " << display << ": " << line;
             }
             ++line_count;
         }
@@ -129,39 +138,47 @@ struct InvalidCliCase {
         pos = nl + 1;
     }
     EXPECT_EQ(line_count, expected_entry_count)
-        << "Fingerprint line count mismatch in: " << hash_file;
+        << "Fingerprint line count mismatch in: " << display;
     return text;
 }
 
-// Verifies raw JPEG SOI markers and independent OpenCV BGR decoding.
+// Verifies raw JPEG SOI markers and independent OpenCV BGR decoding from memory.
 [[nodiscard]] cv::Mat decode_verified_jpeg(
     const fs::path& file, std::optional<cv::Size> expected_size = std::nullopt) {
-    EXPECT_TRUE(fs::is_regular_file(file)) << "Missing JPEG: " << file;
+    const std::string display = test_support::path_to_utf8(file);
+    EXPECT_TRUE(fs::is_regular_file(file)) << "Missing JPEG: " << display;
     if (!fs::is_regular_file(file)) {
         return {};
     }
 
     const auto bytes = test_support::read_file_bytes(file);
-    EXPECT_GE(bytes.size(), kMinJpegBytes) << "Truncated JPEG: " << file;
+    EXPECT_GE(bytes.size(), kMinJpegBytes) << "Truncated JPEG: " << display;
     if (bytes.size() < kMinJpegBytes) {
         return {};
     }
-    EXPECT_EQ(std::to_integer<unsigned>(bytes[0]), kJpegSoiFirst) << "Bad JPEG SOI[0]: " << file;
-    EXPECT_EQ(std::to_integer<unsigned>(bytes[1]), kJpegSoiSecond) << "Bad JPEG SOI[1]: " << file;
+    EXPECT_EQ(std::to_integer<unsigned>(bytes[0]), kJpegSoiFirst)
+        << "Bad JPEG SOI[0]: " << display;
+    EXPECT_EQ(std::to_integer<unsigned>(bytes[1]), kJpegSoiSecond)
+        << "Bad JPEG SOI[1]: " << display;
 
-    cv::Mat image = cv::imread(file.string(), cv::IMREAD_COLOR);
-    EXPECT_FALSE(image.empty()) << "OpenCV failed to decode JPEG: " << file;
+    std::vector<std::uint8_t> encoded;
+    encoded.reserve(bytes.size());
+    for (const std::byte b : bytes) {
+        encoded.push_back(std::to_integer<std::uint8_t>(b));
+    }
+    cv::Mat image = cv::imdecode(encoded, cv::IMREAD_COLOR);
+    EXPECT_FALSE(image.empty()) << "OpenCV failed to decode JPEG: " << display;
     if (image.empty()) {
         return {};
     }
 
     EXPECT_EQ(image.channels(), static_cast<int>(kBgrChannelCount))
-        << "Unexpected channel count: " << file;
-    EXPECT_GT(image.cols, 0) << "Invalid width: " << file;
-    EXPECT_GT(image.rows, 0) << "Invalid height: " << file;
+        << "Unexpected channel count: " << display;
+    EXPECT_GT(image.cols, 0) << "Invalid width: " << display;
+    EXPECT_GT(image.rows, 0) << "Invalid height: " << display;
     if (expected_size) {
-        EXPECT_EQ(image.cols, expected_size->width) << "Width mismatch: " << file;
-        EXPECT_EQ(image.rows, expected_size->height) << "Height mismatch: " << file;
+        EXPECT_EQ(image.cols, expected_size->width) << "Width mismatch: " << display;
+        EXPECT_EQ(image.rows, expected_size->height) << "Height mismatch: " << display;
     }
     return image;
 }
@@ -172,15 +189,16 @@ struct InvalidCliCase {
         return {};
     }
     EXPECT_GT(max_channel_stddev(mosaic), kMinImageStdDev)
-        << "Mosaic appears visually uniform: " << mosaic_file;
+        << "Mosaic appears visually uniform: " << test_support::path_to_utf8(mosaic_file);
     return mosaic;
 }
 
 [[nodiscard]] std::vector<cv::Mat> verify_equally_spaced_frames(
     const fs::path& image_dir, std::size_t expected_count, cv::Size expected_size) {
-    EXPECT_TRUE(fs::is_directory(image_dir)) << "Expected image dir: " << image_dir;
+    const std::string display = test_support::path_to_utf8(image_dir);
+    EXPECT_TRUE(fs::is_directory(image_dir)) << "Expected image dir: " << display;
     const auto entries = test_support::list_all_entries(image_dir);
-    EXPECT_EQ(entries.size(), expected_count) << "Unexpected entry count in: " << image_dir;
+    EXPECT_EQ(entries.size(), expected_count) << "Unexpected entry count in: " << display;
 
     std::vector<cv::Mat> decoded;
     decoded.reserve(expected_count);
@@ -193,7 +211,8 @@ struct InvalidCliCase {
 
 [[nodiscard]] std::vector<fs::path> collect_verified_striking_frames(
     const fs::path& detect_dir, cv::Size expected_size) {
-    EXPECT_TRUE(fs::is_directory(detect_dir)) << "Expected detect dir: " << detect_dir;
+    const std::string display = test_support::path_to_utf8(detect_dir);
+    EXPECT_TRUE(fs::is_directory(detect_dir)) << "Expected detect dir: " << display;
     const auto striking_files = test_support::list_regular_files(detect_dir, ".jpg", "striking_");
     EXPECT_GE(striking_files.size(), kMinStrikingFrames) << "Expected at least 1 striking frame";
     EXPECT_LE(striking_files.size(), kMaxStrikingFrames)
@@ -201,11 +220,12 @@ struct InvalidCliCase {
 
     const auto all_entries = test_support::list_all_entries(detect_dir);
     EXPECT_EQ(all_entries.size(), striking_files.size() + kDetectHashFileCount)
-        << "Unexpected stray files or temp dirs in: " << detect_dir;
+        << "Unexpected stray files or temp dirs in: " << display;
 
     for (const auto& frame_path : striking_files) {
         const cv::Mat frame = decode_verified_jpeg(frame_path, expected_size);
-        EXPECT_FALSE(frame.empty()) << "Failed decoding striking frame: " << frame_path;
+        EXPECT_FALSE(frame.empty())
+            << "Failed decoding striking frame: " << test_support::path_to_utf8(frame_path);
     }
     return striking_files;
 }
@@ -213,14 +233,28 @@ struct InvalidCliCase {
 void verify_pinned_files_untouched(std::span<const PinnedFile> pinned, std::string_view phase) {
     SCOPED_TRACE(std::string(phase));
     for (const auto& item : pinned) {
-        EXPECT_TRUE(fs::is_regular_file(item.path)) << "Pinned file missing: " << item.path;
+        const std::string display = test_support::path_to_utf8(item.path);
+        EXPECT_TRUE(fs::is_regular_file(item.path)) << "Pinned file missing: " << display;
         if (!fs::is_regular_file(item.path)) {
             continue;
         }
         EXPECT_EQ(fs::last_write_time(item.path), item.pinned_mtime)
-            << "File rewritten despite expected cache hit: " << item.path;
+            << "File rewritten despite expected cache hit: " << display;
         EXPECT_TRUE(item.snapshot.is_unchanged())
-            << "File content changed despite expected cache hit: " << item.path;
+            << "File content changed despite expected cache hit: " << display;
+    }
+}
+
+void expect_no_stray_temp_dirs(const fs::path& root_dir) {
+    if (!fs::exists(root_dir)) {
+        return;
+    }
+    for (const auto& entry : fs::recursive_directory_iterator(root_dir)) {
+        const std::string name = test_support::path_to_utf8(entry.path().filename());
+        EXPECT_NE(name, kTempCandidatesDirName)
+            << "Stray temp directory leaked: " << test_support::path_to_utf8(entry.path());
+        EXPECT_NE(name, kTempTextDirName)
+            << "Stray temp directory leaked: " << test_support::path_to_utf8(entry.path());
     }
 }
 
@@ -337,6 +371,7 @@ TEST(ExtractAppTest, SingleFileCombinedImageDetectAndMosaic) {
     const std::string mosaic_hash = read_non_empty_cache_file(mosaics_dir / ".mosaic_hash");
     EXPECT_FALSE(mosaic_hash.empty());
 
+    expect_no_stray_temp_dirs(out_dir);
     EXPECT_TRUE(video_snap.is_unchanged());
 }
 
@@ -367,6 +402,7 @@ TEST(ExtractAppTest, DetectAndMosaicCacheHitAndInvalidationLifecycle) {
     ASSERT_EQ(test_support::run_tool_app<ExtractApp>(
                   {"extract", "-i", in_arg, "-o", out_arg, "--image-detect", "--mosaic", "2"}),
               0);
+    expect_no_stray_temp_dirs(out_dir);
 
     const auto initial_striking = collect_verified_striking_frames(detect_dir, src_size);
     ASSERT_GE(initial_striking.size(), kMinLifecycleStrikingFrames);
@@ -455,6 +491,7 @@ TEST(ExtractAppTest, DetectAndMosaicCacheHitAndInvalidationLifecycle) {
         read_verified_dir_fingerprint_file(detect_hash_file, restored_striking.size());
     EXPECT_FALSE(detect_hash_2.empty());
 
+    expect_no_stray_temp_dirs(out_dir);
     EXPECT_TRUE(video_snap.is_unchanged());
 }
 
@@ -514,19 +551,23 @@ TEST(ExtractAppTest, ExtractTextModeProducesOnlyValidCropsAndPreservesInput) {
     const auto all_entries = test_support::list_all_entries(text_dir);
     const auto jpg_crops = test_support::list_regular_files(text_dir, ".jpg", "text_");
     EXPECT_EQ(all_entries.size(), jpg_crops.size())
-        << "Stray non-crop files found in text output dir: " << text_dir;
+        << "Stray non-crop files found in text output dir: "
+        << test_support::path_to_utf8(text_dir);
     ASSERT_GE(jpg_crops.size(), 1u)
-        << "Expected at least one detected text crop from real capture in: " << text_dir;
+        << "Expected at least one detected text crop from real capture in: "
+        << test_support::path_to_utf8(text_dir);
 
     for (const auto& crop_path : jpg_crops) {
+        const std::string display = test_support::path_to_utf8(crop_path);
         const cv::Mat crop = decode_verified_jpeg(crop_path);
-        ASSERT_FALSE(crop.empty()) << "Failed to decode text crop: " << crop_path;
+        ASSERT_FALSE(crop.empty()) << "Failed to decode text crop: " << display;
         EXPECT_LE(crop.cols, src_info.width);
         EXPECT_LE(crop.rows, src_info.height);
         EXPECT_GT(max_channel_stddev(crop), 0.0)
-            << "Text crop has zero pixel contrast: " << crop_path;
+            << "Text crop has zero pixel contrast: " << display;
     }
 
+    expect_no_stray_temp_dirs(out_dir);
     EXPECT_TRUE(video_snap.is_unchanged());
 }
 
@@ -554,9 +595,9 @@ TEST(ExtractAppTest, RejectsInvalidCliOptionsWithoutLeakingOutputs) {
         std::vector<std::string> args{
             "extract",
             "-i",
-            (tc.use_missing_input ? missing_path : clip).string(),
+            test_support::path_to_utf8(tc.use_missing_input ? missing_path : clip),
             "-o",
-            case_out.string(),
+            test_support::path_to_utf8(case_out),
         };
         for (const std::string_view arg : tc.extra_args) {
             if (!arg.empty()) {
@@ -567,12 +608,13 @@ TEST(ExtractAppTest, RejectsInvalidCliOptionsWithoutLeakingOutputs) {
         const int rc = test_support::run_tool_app<ExtractApp>(args);
         EXPECT_EQ(rc, 1);
         EXPECT_FALSE(has_any_files_recursively(case_out))
-            << "Invalid CLI case leaked output files into: " << case_out;
+            << "Invalid CLI case leaked output files into: "
+            << test_support::path_to_utf8(case_out);
     }
 
     const fs::path overflow_out = sandbox.child("mosaic_overflow");
-    const std::string clip_arg = clip.string();
-    const std::string overflow_arg = overflow_out.string();
+    const std::string clip_arg = test_support::path_to_utf8(clip);
+    const std::string overflow_arg = test_support::path_to_utf8(overflow_out);
     const fs::path mosaics_dir = overflow_out / clip.stem() / "mosaics";
 
     EXPECT_EQ(test_support::run_tool_app<ExtractApp>(
@@ -589,5 +631,129 @@ TEST(ExtractAppTest, RejectsInvalidCliOptionsWithoutLeakingOutputs) {
     EXPECT_FALSE(fs::exists(mosaics_dir / "mosaic.jpg"));
     EXPECT_FALSE(fs::exists(mosaics_dir / ".mosaic_hash"));
 
+    expect_no_stray_temp_dirs(overflow_out);
     EXPECT_TRUE(clip_snap.is_unchanged());
+}
+
+TEST(ExtractAppTest, UnicodeNonAsciiPathsExtractImageDetectAndMosaic) {
+    const fs::path video = test_support::require_fixture(test_support::kFixtureMainVideo);
+    ASSERT_TRUE(fs::is_regular_file(video));
+
+    const test_support::ScopedTempDir sandbox("extract_unicode");
+    const fs::path video_copy = sandbox.copy_in(video, kUnicodeVideoRel);
+    const fs::path out_dir = sandbox.child(kUnicodeOutDir);
+
+    const av::MediaInfo src_info = av::probe(video_copy);
+    ASSERT_TRUE(src_info.ok);
+    ASSERT_EQ(src_info.width, kMosaicWidth);
+    ASSERT_EQ(src_info.height, kMosaicHeight);
+    const cv::Size src_size{src_info.width, src_info.height};
+
+    const test_support::FileSnapshot video_snap(video_copy);
+    const std::string in_arg = test_support::path_to_utf8(video_copy);
+    const std::string out_arg = test_support::path_to_utf8(out_dir);
+    const int rc = test_support::run_tool_app<ExtractApp>(
+        {"extract", "-i", in_arg, "-o", out_arg, "--image", "3", "--image-detect", "--mosaic",
+         "2"});
+    ASSERT_EQ(rc, 0);
+
+    expect_no_stray_temp_dirs(out_dir);
+    EXPECT_EQ(test_support::list_all_entries(out_dir).size(), kExpectedSingleSubdir);
+
+    const fs::path stem_dir = out_dir / video_copy.stem();
+    EXPECT_EQ(test_support::path_to_utf8(video_copy.stem()),
+              test_support::u8_to_utf8(kUnicodeVideoStem));
+    EXPECT_EQ(test_support::list_all_entries(stem_dir).size(), kExpectedCombinedSubdirs);
+
+    const auto image_frames =
+        verify_equally_spaced_frames(stem_dir / "image", kCombinedImageCount, src_size);
+    ASSERT_EQ(image_frames.size(), kCombinedImageCount);
+    ASSERT_FALSE(image_frames.front().empty());
+    ASSERT_FALSE(image_frames.back().empty());
+    EXPECT_GT(cv::norm(image_frames.front(), image_frames.back(), cv::NORM_L2), 0.0);
+
+    const fs::path detect_dir = stem_dir / "detect";
+    const auto striking_files = collect_verified_striking_frames(detect_dir, src_size);
+    EXPECT_FALSE(striking_files.empty());
+    const std::string detect_hash =
+        read_verified_dir_fingerprint_file(detect_dir / ".detect_hash", striking_files.size());
+    EXPECT_FALSE(detect_hash.empty());
+
+    const fs::path mosaics_dir = stem_dir / "mosaics";
+    EXPECT_EQ(test_support::list_all_entries(mosaics_dir).size(), kExpectedMosaicEntries);
+    const cv::Mat mosaic = decode_verified_mosaic(mosaics_dir / "mosaic.jpg");
+    EXPECT_FALSE(mosaic.empty());
+    const std::string mosaic_hash = read_non_empty_cache_file(mosaics_dir / ".mosaic_hash");
+    EXPECT_FALSE(mosaic_hash.empty());
+
+    EXPECT_TRUE(video_snap.is_unchanged());
+    EXPECT_EQ(test_support::list_all_entries(video_copy.parent_path()).size(),
+              kExpectedSingleSubdir);
+}
+
+TEST(ExtractAppTest, IndependentColdRunsProduceConsistentDetectAndMosaicOutputs) {
+    const fs::path video = test_support::require_fixture(test_support::kFixtureMainVideo);
+    ASSERT_TRUE(fs::is_regular_file(video));
+
+    const av::MediaInfo src_info = av::probe(video);
+    ASSERT_TRUE(src_info.ok);
+    ASSERT_EQ(src_info.width, kMosaicWidth);
+    ASSERT_EQ(src_info.height, kMosaicHeight);
+    const cv::Size src_size{src_info.width, src_info.height};
+
+    const test_support::FileSnapshot video_snap(video);
+    const test_support::ScopedTempDir sandbox("extract_determinism");
+    const fs::path out_dir_a = sandbox.child("run_a");
+    const fs::path out_dir_b = sandbox.child("run_b");
+
+    const std::string in_arg = test_support::path_to_utf8(video);
+    const std::string out_arg_a = test_support::path_to_utf8(out_dir_a);
+    const std::string out_arg_b = test_support::path_to_utf8(out_dir_b);
+
+    ASSERT_EQ(test_support::run_tool_app<ExtractApp>(
+                  {"extract", "-i", in_arg, "-o", out_arg_a, "--image", "3", "--image-detect",
+                   "--mosaic", "2"}),
+              0);
+    ASSERT_EQ(test_support::run_tool_app<ExtractApp>(
+                  {"extract", "-i", in_arg, "-o", out_arg_b, "--image", "3", "--image-detect",
+                   "--mosaic", "2"}),
+              0);
+
+    expect_no_stray_temp_dirs(out_dir_a);
+    expect_no_stray_temp_dirs(out_dir_b);
+
+    const fs::path stem_a = out_dir_a / video.stem();
+    const fs::path stem_b = out_dir_b / video.stem();
+    EXPECT_EQ(test_support::list_all_entries(stem_a).size(), kExpectedCombinedSubdirs);
+    EXPECT_EQ(test_support::list_all_entries(stem_b).size(), kExpectedCombinedSubdirs);
+
+    const auto images_a =
+        verify_equally_spaced_frames(stem_a / "image", kCombinedImageCount, src_size);
+    const auto images_b =
+        verify_equally_spaced_frames(stem_b / "image", kCombinedImageCount, src_size);
+    ASSERT_EQ(images_a.size(), images_b.size());
+
+    const auto striking_a = collect_verified_striking_frames(stem_a / "detect", src_size);
+    const auto striking_b = collect_verified_striking_frames(stem_b / "detect", src_size);
+    ASSERT_EQ(striking_a.size(), striking_b.size())
+        << "Independent cold runs produced different striking frame counts";
+
+    EXPECT_FALSE(read_verified_dir_fingerprint_file(
+                     stem_a / "detect" / ".detect_hash", striking_a.size())
+                     .empty());
+    EXPECT_FALSE(read_verified_dir_fingerprint_file(
+                     stem_b / "detect" / ".detect_hash", striking_b.size())
+                     .empty());
+
+    EXPECT_EQ(test_support::list_all_entries(stem_a / "mosaics").size(), kExpectedMosaicEntries);
+    EXPECT_EQ(test_support::list_all_entries(stem_b / "mosaics").size(), kExpectedMosaicEntries);
+    const cv::Mat mosaic_a = decode_verified_mosaic(stem_a / "mosaics" / "mosaic.jpg");
+    const cv::Mat mosaic_b = decode_verified_mosaic(stem_b / "mosaics" / "mosaic.jpg");
+    ASSERT_FALSE(mosaic_a.empty());
+    ASSERT_FALSE(mosaic_b.empty());
+    EXPECT_EQ(mosaic_a.size(), mosaic_b.size());
+    EXPECT_FALSE(read_non_empty_cache_file(stem_a / "mosaics" / ".mosaic_hash").empty());
+    EXPECT_FALSE(read_non_empty_cache_file(stem_b / "mosaics" / ".mosaic_hash").empty());
+
+    EXPECT_TRUE(video_snap.is_unchanged());
 }
